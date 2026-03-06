@@ -5,7 +5,6 @@ import sys
 import time
 import logging
 from datetime import datetime, timedelta, timezone
-from logging.handlers import RotatingFileHandler
 from collections import defaultdict
 
 import requests
@@ -29,13 +28,17 @@ WORKDAY_CONFIG = {
 }
 
 PROOFPOINT_CONFIG = {
-    'base_url':          os.getenv('PROOFPOINT_BASE_URL'),
-    'api_key':           os.getenv('PROOFPOINT_API_KEY'),
-    'page_size':         int(os.getenv('PROOFPOINT_PAGE_SIZE', '500')),
-    'verify_ssl':        os.getenv('PROOFPOINT_VERIFY_SSL', 'False').lower() == 'true',
-    'rate_limit_delay':  float(os.getenv('PROOFPOINT_RATE_LIMIT_DELAY', '1.0')),
-    'retry_delay':       float(os.getenv('PROOFPOINT_RETRY_DELAY', '5.0')),
-    'max_retries':       int(os.getenv('PROOFPOINT_MAX_RETRIES', '3')),
+    # Full URL to the phishing_extended endpoint, e.g.:
+    # https://results.us.securityeducation.com/api/reporting/v0.3.0/phishing_extended
+    'base_url':                   os.getenv('PROOFPOINT_BASE_URL'),
+    'api_key':                    os.getenv('PROOFPOINT_API_KEY'),
+    'page_size':                  int(os.getenv('PROOFPOINT_PAGE_SIZE', '500')),
+    'verify_ssl':                 os.getenv('PROOFPOINT_VERIFY_SSL', 'False').lower() == 'true',
+    'rate_limit_delay':           float(os.getenv('PROOFPOINT_RATE_LIMIT_DELAY', '1.0')),
+    'retry_delay':                float(os.getenv('PROOFPOINT_RETRY_DELAY', '5.0')),
+    'max_retries':                int(os.getenv('PROOFPOINT_MAX_RETRIES', '3')),
+    # How many days back to scan for new campaigns on each daily run.
+    'discovery_lookback_days':    int(os.getenv('PROOFPOINT_DISCOVERY_LOOKBACK_DAYS', '30')),
 }
 
 SHAREPOINT_CONFIG = {
@@ -119,10 +122,10 @@ logger = setup_logging()
 #   "processed_guids": ["guid1", "guid2"],
 #   "pending_campaigns": [
 #     {
-#       "guid": "abc123",
-#       "title": "Q1 Phish",
-#       "startDate": "2025-03-01",
-#       "endDate": "2025-03-07",
+#       "guid":         "abc123",
+#       "title":        "Q1 Phish",
+#       "startDate":    "2025-03-01",
+#       "endDate":      "2025-03-07",
 #       "detected_utc": "2025-03-01T10:00:00+00:00"
 #     }
 #   ],
@@ -224,73 +227,144 @@ def add_executive_leadership_column(df: pd.DataFrame) -> pd.DataFrame:
 # CAMPAIGN DISCOVERY
 # ============================================
 
-def fetch_latest_campaigns() -> list:
+def discover_campaigns_from_phishing_extended() -> list:
     """
-    Fetch the full campaign list from Proofpoint.
+    Proofpoint has no dedicated campaign-list endpoint.
+    Query phishing_extended with a lookback window and extract unique
+    campaigns from the event records.
 
-    Each campaign dict must contain at minimum:
-      guid / id  —  unique identifier
-      startDate  —  ISO 8601 or YYYY-MM-DD
-      endDate    —  ISO 8601 or YYYY-MM-DD
-      name / title
+    Each returned dict contains:
+      guid, title, startDate (YYYY-MM-DD), endDate (YYYY-MM-DD)
 
-    Adjust the endpoint path and response mapping to match your Proofpoint
-    API version / tenant configuration.
+    Uses filter[_includenoaction]=TRUE so campaigns with no user interactions
+    are still surfaced via their 'No Action' event rows.
     """
-    logger.info("Fetching campaign list from Proofpoint...")
-    headers = {'x-apikey-token': PROOFPOINT_CONFIG['api_key']}
-    url     = f"{PROOFPOINT_CONFIG['base_url']}/campaigns"
+    lookback_days = PROOFPOINT_CONFIG['discovery_lookback_days']
+    today         = datetime.now(tz=timezone.utc).date()
+    scan_start    = (today - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
+    scan_end      = today.strftime('%Y-%m-%d')
 
-    try:
-        resp = requests.get(
-            url,
-            headers=headers,
-            timeout=30,
-            verify=PROOFPOINT_CONFIG['verify_ssl'],
-        )
-        resp.raise_for_status()
-        data      = resp.json()
-        campaigns = data.get('data', data.get('campaigns', data if isinstance(data, list) else []))
-        logger.info("Fetched %d campaigns from Proofpoint.", len(campaigns))
-        return campaigns
-    except Exception as e:
-        logger.exception("Failed to fetch campaign list: %s", e)
-        return []
+    logger.info(
+        "Discovering campaigns via phishing_extended (lookback %d days: %s → %s)...",
+        lookback_days, scan_start, scan_end,
+    )
+
+    headers    = {'x-apikey-token': PROOFPOINT_CONFIG['api_key']}
+    page       = 1
+    seen_guids = {}   # guid → campaign dict
+
+    while True:
+        params = {
+            'page[number]':                     page,
+            'page[size]':                       PROOFPOINT_CONFIG['page_size'],
+            'filter[_campaignstartdate_start]': scan_start,
+            'filter[_campaignstartdate_end]':   scan_end,
+            'filter[_includenoaction]':         'TRUE',
+        }
+
+        for attempt in range(1, PROOFPOINT_CONFIG['max_retries'] + 1):
+            try:
+                if page > 1 or attempt > 1:
+                    time.sleep(PROOFPOINT_CONFIG['rate_limit_delay'])
+
+                resp = requests.get(
+                    PROOFPOINT_CONFIG['base_url'],
+                    headers=headers,
+                    params=params,
+                    timeout=30,
+                    verify=PROOFPOINT_CONFIG['verify_ssl'],
+                )
+
+                if resp.status_code == 429:
+                    wait = int(resp.headers.get('Retry-After', PROOFPOINT_CONFIG['retry_delay']))
+                    logger.warning("429 Too Many Requests. Sleeping %ds.", wait)
+                    time.sleep(wait)
+                    continue
+
+                resp.raise_for_status()
+                data      = resp.json()
+                page_data = data.get('data', [])
+
+                for record in page_data:
+                    attrs = record.get('attributes', {})
+                    guid  = attrs.get('campaign_guid')
+                    if not guid or guid in seen_guids:
+                        continue
+
+                    raw_start = attrs.get('campaignstartdate', '')
+                    raw_end   = attrs.get('campaignenddate',   raw_start)
+
+                    try:
+                        start_str = _parse_date(raw_start).strftime('%Y-%m-%d')
+                    except ValueError:
+                        start_str = ''
+
+                    try:
+                        end_str = _parse_date(raw_end).strftime('%Y-%m-%d')
+                    except ValueError:
+                        end_str = start_str
+
+                    seen_guids[guid] = {
+                        'guid':      guid,
+                        'title':     attrs.get('campaignname') or guid,
+                        'startDate': start_str,
+                        'endDate':   end_str,
+                    }
+
+                if not page_data:
+                    break   # no more pages
+
+                page += 1
+                break   # success — move to next page
+
+            except requests.RequestException as e:
+                logger.error("Discovery request error (attempt %d/%d): %s",
+                             attempt, PROOFPOINT_CONFIG['max_retries'], e)
+                if attempt == PROOFPOINT_CONFIG['max_retries']:
+                    logger.warning("Max retries reached during discovery. Stopping.")
+                    return list(seen_guids.values())
+                time.sleep(PROOFPOINT_CONFIG['retry_delay'])
+        else:
+            break   # all retries exhausted
+
+    campaigns = list(seen_guids.values())
+    logger.info("Discovered %d unique campaign(s) in the lookback window.", len(campaigns))
+    for c in campaigns:
+        logger.info("  guid=%-12s start=%-12s end=%-12s title='%s'",
+                    c['guid'], c['startDate'], c['endDate'], c['title'])
+    return campaigns
 
 
 def sync_pending_campaigns(state: dict) -> dict:
     """
-    Fetch ALL campaigns from Proofpoint and add any unseen guids to
+    Discover campaigns from phishing_extended and add any unseen guids to
     pending_campaigns. Deduplicates against both processed_guids and
-    already-pending guids so no campaign is queued twice.
+    already-pending guids so no campaign is ever queued twice.
     """
-    campaigns = fetch_latest_campaigns()
+    campaigns = discover_campaigns_from_phishing_extended()
     if not campaigns:
-        logger.warning("No campaigns returned from Proofpoint — skipping sync.")
+        logger.warning("No campaigns discovered — skipping sync.")
         return state
 
-    processed   = set(state.get('processed_guids', []))
-    pending_ids = {c['guid'] for c in state.get('pending_campaigns', [])}
+    processed    = set(state.get('processed_guids', []))
+    pending_ids  = {c['guid'] for c in state.get('pending_campaigns', [])}
     newly_queued = 0
 
     for c in campaigns:
-        guid = c.get('guid') or c.get('id')
-        if not guid or guid in processed or guid in pending_ids:
+        guid = c['guid']
+        if guid in processed or guid in pending_ids:
             continue
-
-        raw_start = c.get('startDate') or c.get('start_date', '')
-        raw_end   = c.get('endDate')   or c.get('end_date', raw_start)
 
         state['pending_campaigns'].append({
             'guid':         guid,
-            'title':        c.get('name') or c.get('title') or guid,
-            'startDate':    raw_start,
-            'endDate':      raw_end,
+            'title':        c['title'],
+            'startDate':    c['startDate'],
+            'endDate':      c['endDate'],
             'detected_utc': datetime.now(tz=timezone.utc).isoformat(),
         })
         pending_ids.add(guid)
         newly_queued += 1
-        logger.info("Queued new campaign: guid=%s title='%s'", guid, c.get('name') or guid)
+        logger.info("Queued new campaign: guid=%s title='%s'", guid, c['title'])
 
     logger.info(
         "Sync complete: %d new queued | %d total pending | %d total processed.",
@@ -383,28 +457,27 @@ def get_sharepoint_token() -> str:
 
 
 def _ensure_sharepoint_folder(headers: dict, graph_base: str, site_id: str, folder_path: str):
-    """Walk each segment of folder_path and create any missing folders."""
-    parts   = [p for p in folder_path.split('/') if p]
-    current = ''
-    for part in parts:
-        parent    = f"root:{current}" if current else 'root'
-        list_url  = f"{graph_base}/sites/{site_id}/drive/{parent}/children"
-        list_resp = requests.get(list_url, headers=headers, timeout=30)
-        if list_resp.status_code == 200:
-            existing = {item['name'] for item in list_resp.json().get('value', [])}
-            if part not in existing:
-                requests.post(
-                    list_url,
-                    headers={**headers, 'Content-Type': 'application/json'},
-                    json={
-                        'name':   part,
-                        'folder': {},
-                        '@microsoft.graph.conflictBehavior': 'replace',
-                    },
-                    timeout=30,
-                ).raise_for_status()
-                logger.info("Created SharePoint folder: %s/%s", current, part)
-        current += f'/{part}'
+    """
+    Verify that folder_path already exists in SharePoint.
+    Raises FileNotFoundError if it does not — prevents silent typos in
+    SHAREPOINT_XLSX_FOLDER / SHAREPOINT_CSV_FOLDER from going unnoticed.
+    """
+    probe_url = f"{graph_base}/sites/{site_id}/drive/root:{folder_path}"
+    resp      = requests.get(probe_url, headers=headers, timeout=30)
+
+    if resp.status_code == 200:
+        logger.info("SharePoint folder confirmed: %s", folder_path)
+        return
+
+    if resp.status_code == 404:
+        raise FileNotFoundError(
+            f"SharePoint folder not found: '{folder_path}'. "
+            "Check SHAREPOINT_XLSX_FOLDER / SHAREPOINT_CSV_FOLDER. "
+            "Path must be relative to the site root, e.g. "
+            "'/Shared Documents/Reports/Excel'."
+        )
+
+    resp.raise_for_status()
 
 
 def upload_to_sharepoint(file_bytes: bytes, filename: str, folder_path: str):
@@ -433,7 +506,7 @@ def upload_to_sharepoint(file_bytes: bytes, filename: str, folder_path: str):
         )
         resp.raise_for_status()
         logger.info(
-            "Uploaded '%s' → SharePoint folder '%s' (simple, %d bytes).",
+            "Uploaded '%s' → '%s' (simple, %d bytes).",
             filename, folder_path, len(file_bytes),
         )
     else:
@@ -446,7 +519,7 @@ def upload_to_sharepoint(file_bytes: bytes, filename: str, folder_path: str):
         session_resp.raise_for_status()
         session_upload_url = session_resp.json()['uploadUrl']
 
-        chunk_size = 3 * 1024 * 1024   # must be a multiple of 320 KiB
+        chunk_size    = 3 * 1024 * 1024   # must be a multiple of 320 KiB
         total, offset = len(file_bytes), 0
 
         while offset < total:
@@ -465,7 +538,7 @@ def upload_to_sharepoint(file_bytes: bytes, filename: str, folder_path: str):
             offset = end
 
         logger.info(
-            "Uploaded '%s' → SharePoint folder '%s' (resumable, %d bytes).",
+            "Uploaded '%s' → '%s' (resumable, %d bytes).",
             filename, folder_path, total,
         )
 
@@ -495,7 +568,7 @@ def fetch_workday_workers(campaign_start_date: str) -> list:
     Fetch all workers who are either:
       - Active, OR
       - Terminated on or after campaign_start_date
-    Paginated at 1 000 records per page.
+    Paginated at 1,000 records per page.
     """
     logger.info(
         "Fetching Workday workers (active OR terminated >= %s)...",
@@ -540,6 +613,8 @@ def fetch_workday_workers(campaign_start_date: str) -> list:
 def fetch_proofpoint_records(start_date: str, end_date: str) -> list:
     """
     Fetch all Proofpoint phishing records for the given date window.
+    Uses filter[_campaignstartdate_start/end] so the window is anchored to
+    campaign start date, not event timestamp.
     Includes no-action users and deleted users for full parity with the UI.
     Validates fetched count against meta.count to detect partial fetches.
     """
@@ -601,7 +676,7 @@ def fetch_proofpoint_records(start_date: str, end_date: str) -> list:
                     page_number += 1
                 else:
                     has_more_pages = False
-                break  # successful response — exit retry loop
+                break   # successful response — exit retry loop
 
             except requests.RequestException as e:
                 logger.error("Proofpoint request error (attempt %d/%d): %s",
@@ -679,44 +754,44 @@ def transform_proofpoint_data(records: list) -> list:
             fp_count += 1
 
         transformed.append({
-            'Email Address':             first.get('useremailaddress'),
-            'First Name':                first.get('userfirstname'),
-            'Last Name':                 first.get('userlastname'),
-            'Campaign Guid':             first.get('campaign_guid'),
-            'Users Guid':                first.get('user_guid'),
-            'Campaign Title':            first.get('campaignname'),
-            'Phishing Template':         first.get('templatename'),
-            'Date Sent':                 date_sent,
-            'Primary Email Opened':      b(views),
-            'Date Email Opened':         first_attr(views, 'eventtimestamp'),
-            'Multi Email Open':          max(0, len(views) - 1),
-            'Email Opened IP Address':   first_attr(views, 'ip_address'),
-            'Email Opened Browser':      first_attr(views, 'browser'),
+            'Email Address':                first.get('useremailaddress'),
+            'First Name':                   first.get('userfirstname'),
+            'Last Name':                    first.get('userlastname'),
+            'Campaign Guid':                first.get('campaign_guid'),
+            'Users Guid':                   first.get('user_guid'),
+            'Campaign Title':               first.get('campaignname'),
+            'Phishing Template':            first.get('templatename'),
+            'Date Sent':                    date_sent,
+            'Primary Email Opened':         b(views),
+            'Date Email Opened':            first_attr(views, 'eventtimestamp'),
+            'Multi Email Open':             max(0, len(views) - 1),
+            'Email Opened IP Address':      first_attr(views, 'ip_address'),
+            'Email Opened Browser':         first_attr(views, 'browser'),
             'Email Opened Browser Version': first_attr(views, 'browser_version'),
-            'Email Opened OS':           first_attr(views, 'os'),
-            'Email Opened OS Version':   first_attr(views, 'os_version'),
-            'Primary Clicked':           b(primary_clicked),
-            'Date Clicked':              date_clicked,
-            'Multi Click Event':         max(0, len(clicks) - 1),
-            'Clicked IP Address':        first_attr(clicks, 'ip_address'),
-            'Clicked Browser':           first_attr(clicks, 'browser'),
-            'Clicked Browser Version':   first_attr(clicks, 'browser_version'),
-            'Clicked OS':                first_attr(clicks, 'os'),
-            'Clicked OS Version':        first_attr(clicks, 'os_version'),
-            'Primary Compromised Login': b(submissions),
-            'Date Login Compromised':    first_attr(submissions, 'eventtimestamp'),
-            'Multi Compromised':         max(0, len(submissions) - 1),
-            'Primary Attachment Open':   b(attachments),
-            'Date Attachment Open':      first_attr(attachments, 'eventtimestamp'),
-            'Multi Attachment Open':     max(0, len(attachments) - 1),
-            'Reported':                  b(reported),
-            'Date Reported':             first_attr(reported, 'eventtimestamp'),
-            'Passed?':                   b(not failed),
-            'Whois ISP':                 whois_isp,
-            'Whois Country':             whois_src.get('whois_country'),
-            'Teachable Moment Started':  b(tm_sent),
-            'Acknowledgement Completed': b(tm_done),
-            'False Positive':            b(is_fp),
+            'Email Opened OS':              first_attr(views, 'os'),
+            'Email Opened OS Version':      first_attr(views, 'os_version'),
+            'Primary Clicked':              b(primary_clicked),
+            'Date Clicked':                 date_clicked,
+            'Multi Click Event':            max(0, len(clicks) - 1),
+            'Clicked IP Address':           first_attr(clicks, 'ip_address'),
+            'Clicked Browser':              first_attr(clicks, 'browser'),
+            'Clicked Browser Version':      first_attr(clicks, 'browser_version'),
+            'Clicked OS':                   first_attr(clicks, 'os'),
+            'Clicked OS Version':           first_attr(clicks, 'os_version'),
+            'Primary Compromised Login':    b(submissions),
+            'Date Login Compromised':       first_attr(submissions, 'eventtimestamp'),
+            'Multi Compromised':            max(0, len(submissions) - 1),
+            'Primary Attachment Open':      b(attachments),
+            'Date Attachment Open':         first_attr(attachments, 'eventtimestamp'),
+            'Multi Attachment Open':        max(0, len(attachments) - 1),
+            'Reported':                     b(reported),
+            'Date Reported':                first_attr(reported, 'eventtimestamp'),
+            'Passed?':                      b(not failed),
+            'Whois ISP':                    whois_isp,
+            'Whois Country':                whois_src.get('whois_country'),
+            'Teachable Moment Started':     b(tm_sent),
+            'Acknowledgement Completed':    b(tm_done),
+            'False Positive':               b(is_fp),
         })
 
     logger.info(
@@ -736,8 +811,8 @@ def merge_datasets(proofpoint_df: pd.DataFrame, workday_df: pd.DataFrame) -> pd.
     pp = proofpoint_df[PROOFPOINT_FIELDS].copy()
     wd = workday_df[WORKDAY_FIELDS + ['Executive Leadership']].copy()
 
-    pp['Email Address']          = pp['Email Address'].str.lower().str.strip()
-    wd['InternetEmailAddress']   = wd['InternetEmailAddress'].str.lower().str.strip()
+    pp['Email Address']        = pp['Email Address'].str.lower().str.strip()
+    wd['InternetEmailAddress'] = wd['InternetEmailAddress'].str.lower().str.strip()
 
     merged = pd.merge(
         pp, wd,
@@ -762,9 +837,9 @@ def build_excel_bytes(workday_df: pd.DataFrame,
                       merged_df: pd.DataFrame) -> bytes:
     """
     Build a 3-sheet Excel workbook in memory.
-      Sheet 1 — Workday Feed      : full employee roster used for the merge
-      Sheet 2 — Proofpoint Data   : campaign-filtered phishing event records
-      Sheet 3 — Merged Data       : campaign-filtered records enriched with Workday data
+      Sheet 1 — Workday Feed    : full employee roster used for the merge
+      Sheet 2 — Proofpoint Data : campaign-filtered phishing event records
+      Sheet 3 — Merged Data     : campaign-filtered records enriched with Workday data
     """
     logger.info("Building Excel workbook in memory...")
     buf = io.BytesIO()
@@ -799,11 +874,12 @@ def run_report_for_campaign(campaign: dict, workday_df: pd.DataFrame) -> bool:
     End-to-end report generation for a single campaign:
       1. Compute fetch date window
       2. Fetch + transform Proofpoint records
-      3. Filter to this campaign guid only
+      3. Filter strictly to this campaign guid only
       4. Merge with Workday
-      5. Build Excel (→ xlsx_folder) and CSV (→ csv_folder) in memory
+      5. Build <CampaignTitle>_<CampaignGuid>.xlsx → xlsx_folder
+         Build <CampaignTitle>_<CampaignGuid>.csv  → csv_folder
       6. Upload both files to their respective SharePoint folders
-    Returns True on success, False on failure.
+    Returns True on success, False on any failure.
     """
     guid  = campaign['guid']
     title = campaign['title']
@@ -830,14 +906,14 @@ def run_report_for_campaign(campaign: dict, workday_df: pd.DataFrame) -> bool:
 
     if proofpoint_df.empty:
         logger.warning(
-            "No Proofpoint records match campaign guid=%s after filtering. "
-            "The date window may have returned records for other campaigns only.",
+            "No records match campaign guid=%s after filtering. "
+            "The date window returned records for other campaigns only.",
             guid,
         )
         return False
 
     logger.info(
-        "Proofpoint records for this campaign: %d (of %d total in date window).",
+        "Records for this campaign: %d (of %d total in date window).",
         len(proofpoint_df), len(all_proofpoint_df),
     )
 
@@ -845,7 +921,7 @@ def run_report_for_campaign(campaign: dict, workday_df: pd.DataFrame) -> bool:
     merged_df = merge_datasets(proofpoint_df, workday_df)
     merged_df = merged_df[merged_df['Campaign Guid'] == guid].copy()
 
-    # ── 5. Build filenames  <CampaignTitle>_<CampaignGuid>.xlsx / .csv ──
+    # ── 5. Filenames:  <CampaignTitle>_<CampaignGuid>.xlsx / .csv ─────
     safe_title = _safe_filename(title)
     xlsx_name  = f"{safe_title}_{guid}.xlsx"
     csv_name   = f"{safe_title}_{guid}.csv"
@@ -854,10 +930,10 @@ def run_report_for_campaign(campaign: dict, workday_df: pd.DataFrame) -> bool:
     csv_bytes  = build_csv_bytes(merged_df)
 
     # ── 6. Upload to separate SharePoint folders ──────────────────────
-    logger.info("Uploading Excel  → %s/%s", SHAREPOINT_CONFIG['xlsx_folder'], xlsx_name)
+    logger.info("Uploading Excel → %s/%s", SHAREPOINT_CONFIG['xlsx_folder'], xlsx_name)
     upload_to_sharepoint(xlsx_bytes, xlsx_name, SHAREPOINT_CONFIG['xlsx_folder'])
 
-    logger.info("Uploading CSV    → %s/%s", SHAREPOINT_CONFIG['csv_folder'],  csv_name)
+    logger.info("Uploading CSV   → %s/%s", SHAREPOINT_CONFIG['csv_folder'], csv_name)
     upload_to_sharepoint(csv_bytes,  csv_name,  SHAREPOINT_CONFIG['csv_folder'])
 
     # ── Summary ───────────────────────────────────────────────────────
@@ -867,7 +943,7 @@ def run_report_for_campaign(campaign: dict, workday_df: pd.DataFrame) -> bool:
     exec_count = int(merged_df['Executive Leadership'].sum()) if 'Executive Leadership' in merged_df.columns else 0
 
     logger.info(
-        "Campaign complete: pp_rows=%d fp=%d merged=%d matched=%d unmatched=%d exec=%d",
+        "Campaign complete: rows=%d fp=%d merged=%d matched=%d unmatched=%d exec=%d",
         len(proofpoint_df), fp_count, len(merged_df), matched, unmatched, exec_count,
     )
     return True
@@ -887,11 +963,11 @@ def main():
     state.setdefault('processed_guids',   [])
     state.setdefault('pending_campaigns', [])
 
-    # ── 2. Discover all new campaigns and add to pending ──────────────────
+    # ── 2. Discover all campaigns in the lookback window and queue new ones ─
     state = sync_pending_campaigns(state)
 
     # ── 3. Check which pending campaigns are ready to report ──────────────
-    #       Ready = today (UTC) >= campaign endDate + END_DATE_OFFSET_DAYS (3)
+    #       Ready = today (UTC) >= campaign endDate + END_DATE_OFFSET_DAYS
     ready_campaigns = get_reportable_campaigns(state)
 
     if not ready_campaigns:
@@ -905,7 +981,7 @@ def main():
 
     logger.info("%d campaign(s) ready to process today.", len(ready_campaigns))
 
-    # ── 4. Fetch Workday ONCE, shared across all campaigns this run ───────
+    # ── 4. Fetch Workday ONCE — shared across all campaigns this run ───────
     #       Use the earliest campaign startDate as the termination lower bound
     #       so terminated workers from the oldest campaign are included.
     earliest_start = min(
@@ -941,8 +1017,8 @@ def main():
             failed.append(campaign['guid'])
 
     # ── 6. Update state ───────────────────────────────────────────────────
-    #       Succeeded guids → processed_guids (never re-run)
-    #       Failed guids    → remain in pending_campaigns (retried tomorrow)
+    #       Succeeded → processed_guids (never re-run)
+    #       Failed    → remain in pending_campaigns (retried tomorrow)
     succeeded_set = set(succeeded)
     state['pending_campaigns'] = [
         c for c in state['pending_campaigns']
