@@ -1,0 +1,87 @@
+name: Phishing Campaign Report
+
+on:
+  # ── Runs once daily at 06:00 UTC ──────────────────────────────────────
+  # Adjust the time to suit your timezone / business hours.
+  schedule:
+    - cron: '0 6 * * *'
+
+  # ── Manual trigger — useful for testing or forcing a re-check ─────────
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required to commit campaign_state.json back to the repo
+
+jobs:
+  generate-report:
+    name: Daily Campaign Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 60   # safeguard against hung API calls
+
+    steps:
+      # ── 1. Checkout (includes campaign_state.json) ────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ── 2. Python setup ───────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ── 3. Install dependencies ───────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Run the campaign merge script ─────────────────────────────
+      - name: Run campaign merge
+        env:
+          # ── Workday ──────────────────────────────────────────────────
+          WORKDAY_CLIENT_ID:     ${{ secrets.WORKDAY_CLIENT_ID }}
+          WORKDAY_CLIENT_SECRET: ${{ secrets.WORKDAY_CLIENT_SECRET }}
+          WORKDAY_TOKEN_URL:     ${{ secrets.WORKDAY_TOKEN_URL }}
+          WORKDAY_API_URL:       ${{ secrets.WORKDAY_API_URL }}
+          WORKDAY_SCOPE:         ${{ secrets.WORKDAY_SCOPE }}
+
+          # ── Proofpoint ────────────────────────────────────────────────
+          PROOFPOINT_BASE_URL:   ${{ secrets.PROOFPOINT_BASE_URL }}
+          PROOFPOINT_API_KEY:    ${{ secrets.PROOFPOINT_API_KEY }}
+
+          # ── SharePoint ────────────────────────────────────────────────
+          SHAREPOINT_TENANT_ID:     ${{ secrets.SHAREPOINT_TENANT_ID }}
+          SHAREPOINT_CLIENT_ID:     ${{ secrets.SHAREPOINT_CLIENT_ID }}
+          SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
+          SHAREPOINT_SITE_ID:       ${{ secrets.SHAREPOINT_SITE_ID }}
+          # Excel reports go here
+          SHAREPOINT_XLSX_FOLDER:   ${{ secrets.SHAREPOINT_XLSX_FOLDER }}
+          # CSV reports go here
+          SHAREPOINT_CSV_FOLDER:    ${{ secrets.SHAREPOINT_CSV_FOLDER }}
+
+          # ── Tunable parameters (set as repo Variables, not Secrets) ───
+          PROOFPOINT_PAGE_SIZE:        '500'
+          PROOFPOINT_RATE_LIMIT_DELAY: '1.0'
+          PROOFPOINT_RETRY_DELAY:      '5.0'
+          PROOFPOINT_MAX_RETRIES:      '3'
+          START_DATE_OFFSET_DAYS:      '-2'   # 2 days before campaign start
+          END_DATE_OFFSET_DAYS:        '3'    # 3 days after  campaign end
+          LOG_LEVEL:                   'INFO'
+          LOG_USE_UTC:                 'true'
+          STATE_FILE_PATH:             'campaign_state.json'
+
+        run: python campaign_merge.py
+
+      # ── 5. Commit updated state file back to the repo ─────────────────
+      # [skip ci] prevents this commit from re-triggering the workflow.
+      # The step only creates a commit when campaign_state.json has changed
+      # (i.e. when at least one campaign was detected or completed).
+      - name: Commit campaign state
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add campaign_state.json
+          git diff --cached --quiet \
+            || git commit -m "chore: update campaign_state.json [skip ci]"
+          git push
