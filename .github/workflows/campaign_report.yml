@@ -52,7 +52,11 @@ jobs:
           PROOFPOINT_RATE_LIMIT_DELAY:        '1.0'
           PROOFPOINT_RETRY_DELAY:             '5.0'
           PROOFPOINT_MAX_RETRIES:             '3'
-          PROOFPOINT_DISCOVERY_LOOKBACK_DAYS: '30'
+          # Discovery: how far back to look for new campaigns
+          PROOFPOINT_DISCOVERY_LOOKBACK_DAYS: '14'
+          # Discovery: max pages to scan before stopping (500 records/page)
+          # Increase if you run more than ~10 campaigns per fortnight
+          PROOFPOINT_DISCOVERY_MAX_PAGES:     '5'
           START_DATE_OFFSET_DAYS:             '-2'
           END_DATE_OFFSET_DAYS:               '3'
           LOG_LEVEL:                          'INFO'
