@@ -1,5 +1,8 @@
 {
-  "processed_guids": [],
+  "processed_guids": [
+    "64693e6b50",
+    "c1f957c32e"
+  ],
   "pending_campaigns": [],
-  "last_run_utc": "2026-03-06T05:25:04.842523+00:00"
+  "last_run_utc": "2026-03-11T11:46:48.505127+00:00"
 }
