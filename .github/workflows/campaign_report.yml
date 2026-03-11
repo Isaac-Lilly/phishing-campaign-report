@@ -12,7 +12,11 @@ jobs:
   generate-report:
     name: Daily Campaign Report
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Increased from 60 to 240 minutes.
+    # Splunk enrichment runs 3 phases of batch queries against AzureAD and
+    # Proofpoint indexes. For a large campaign (5,000+ users) this can take
+    # 60-90 minutes on its own. 240 minutes gives comfortable headroom.
+    timeout-minutes: 240
 
     steps:
       - name: Checkout repository
@@ -42,26 +46,50 @@ jobs:
           PROOFPOINT_BASE_URL: ${{ secrets.PROOFPOINT_BASE_URL }}
           PROOFPOINT_API_KEY:  ${{ secrets.PROOFPOINT_API_KEY }}
 
+          # ── Splunk ────────────────────────────────────────────────
+          # SPLUNK_API_KEY is the only required Splunk secret.
+          # If not set, Splunk enrichment is skipped gracefully and
+          # the report is still generated without OS columns.
+          SPLUNK_API_KEY:  ${{ secrets.SPLUNK_API_KEY }}
+          # Host defaults to lilly-infosec.splunkcloud.com:8089 if not set.
+          # Only override this if your Splunk host has changed.
+          SPLUNK_HOST:     ${{ secrets.SPLUNK_HOST }}
+
           # ── Power Automate ────────────────────────────────────────
           # file_type='excel' → ProofPoint_WorkDay_Splunk_Auto_Backup
           # file_type='csv'   → Autopipeline_MasterReports
-          POWER_AUTOMATE_WEBHOOK_URL: ${{ secrets.POWER_AUTOMATE_WEBHOOK_URL }}
+          POWER_AUTOMATE_WEBHOOK_URL:  ${{ secrets.POWER_AUTOMATE_WEBHOOK_URL }}
+          # Only needed if your Power Automate trigger requires auth header.
+          # Leave secret blank or unset if trigger is set to "Anyone".
+          POWER_AUTOMATE_WEBHOOK_AUTH: ${{ secrets.POWER_AUTOMATE_WEBHOOK_AUTH }}
 
-          # ── Tunable parameters ────────────────────────────────────
+          # ── Proofpoint tuning ─────────────────────────────────────
           PROOFPOINT_PAGE_SIZE:               '500'
           PROOFPOINT_RATE_LIMIT_DELAY:        '1.0'
           PROOFPOINT_RETRY_DELAY:             '5.0'
           PROOFPOINT_MAX_RETRIES:             '3'
-          # Discovery: how far back to look for new campaigns
           PROOFPOINT_DISCOVERY_LOOKBACK_DAYS: '14'
-          # Discovery: max pages to scan before stopping (500 records/page)
-          # Increase if you run more than ~10 campaigns per fortnight
           PROOFPOINT_DISCOVERY_MAX_PAGES:     '5'
           START_DATE_OFFSET_DAYS:             '-2'
           END_DATE_OFFSET_DAYS:               '3'
-          LOG_LEVEL:                          'INFO'
-          LOG_USE_UTC:                        'true'
-          STATE_FILE_PATH:                    'campaign_state.json'
+
+          # ── Splunk tuning ─────────────────────────────────────────
+          # Batch size: number of emails per Splunk query (max 500)
+          SPLUNK_BATCH_SIZE:        '500'
+          # Seconds to wait between Splunk job submissions (avoid throttling)
+          SPLUNK_SUBMIT_DELAY:      '3'
+          SPLUNK_MAX_RETRIES:       '5'
+          SPLUNK_RETRY_DELAY:       '10'
+          SPLUNK_INITIAL_POLL:      '5'
+          SPLUNK_RETRY_JOB_DELAY:   '3'
+          # ±minutes around each user's anchor event for AzureAD lookup
+          # 1440 = ±24 hours. Widen if users sign in from different devices.
+          SPLUNK_TIME_WINDOW_MINUTES: '1440'
+
+          # ── General ───────────────────────────────────────────────
+          LOG_LEVEL:       'INFO'
+          LOG_USE_UTC:     'true'
+          STATE_FILE_PATH: 'campaign_state.json'
 
         run: python campaign_merge.py
 
