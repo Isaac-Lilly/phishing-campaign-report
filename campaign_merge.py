@@ -230,32 +230,64 @@ def _splunk_time(dt) -> str:
     return dt.strftime('%Y-%m-%dT%H:%M:%S')
 
 
-def _normalize_os(val) -> str:
-    if not val or not str(val).strip():
-        return val or ''
-    v = str(val).strip().lower()
-    if v.startswith('ios'):        return 'Ios'
-    if v.startswith('windows'):   return 'Windows'
-    if v.startswith('mac') or v.startswith('macos') or v.startswith('os x'):
-        return 'Mac OS'
-    return str(val).strip()
+def _normalize_os(os_val: str) -> str:
+    """
+    Normalise raw OS string to a canonical name using a priority-ordered map.
+    First match wins.
+    """
+    if not os_val or not str(os_val).strip():
+        return os_val or ''
+
+    os_lower = str(os_val).strip().lower()
+
+    OS_MAP = [
+        ('ipados',    'iPadOS'),
+        ('ios',       'iOS'),
+        ('android',   'Android'),
+        ('windows',   'Windows'),
+        ('mac os',    'macOS'),
+        ('macos',     'macOS'),
+        ('darwin',    'macOS'),
+        ('linux',     'Linux'),
+        ('ubuntu',    'Linux'),
+        ('debian',    'Linux'),
+        ('fedora',    'Linux'),
+        ('centos',    'Linux'),
+        ('chrome os', 'ChromeOS'),
+        ('chromeos',  'ChromeOS'),
+        ('cros',      'ChromeOS'),
+    ]
+    for keyword, canonical in OS_MAP:
+        if os_lower.startswith(keyword) or keyword in os_lower:
+            return canonical
+
+    return str(os_val).strip().title()
 
 
 def _resolve_anchor(row_dict: dict):
     """
-    Returns (timestamp_str, source) for the most relevant event on this row.
-    Returns ('', 'no_action') if the user took no action at all.
+    Returns (timestamp_str, source) for the most relevant FAILURE event.
+
+    Only users who actually FAILED (clicked, submitted data, opened
+    attachment) or REPORTED are worth querying Splunk for OS data.
+
+    Email-opened-only users and no-action users return ('', 'no_action')
+    and are skipped entirely — they have no failure-event OS data in Splunk.
     """
-    reported     = str(row_dict.get('Reported') or '').strip().upper()
-    date_rep     = str(row_dict.get('Date Reported') or '').strip()
-    date_clicked = str(row_dict.get('Date Clicked') or '').strip()
-    date_opened  = str(row_dict.get('Date Email Opened') or '').strip()
+    reported        = str(row_dict.get('Reported') or '').strip().upper()
+    date_rep        = str(row_dict.get('Date Reported') or '').strip()
+    date_clicked    = str(row_dict.get('Date Clicked') or '').strip()
+    date_login      = str(row_dict.get('Date Login Compromised') or '').strip()
+    date_attachment = str(row_dict.get('Date Attachment Open') or '').strip()
+
     if reported == 'TRUE' and date_rep:
         return date_rep, 'date_reported'
     elif date_clicked:
         return date_clicked, 'date_clicked'
-    elif date_opened:
-        return date_opened, 'date_email_opened'
+    elif date_login:
+        return date_login, 'date_login_compromised'
+    elif date_attachment:
+        return date_attachment, 'date_attachment_open'
     return '', 'no_action'
 
 
@@ -284,18 +316,41 @@ def _submit_job(query: str, earliest: str, latest: str) -> str:
 
 
 def _poll_and_fetch(sid: str) -> list:
-    url = f"{SPLUNK_CONFIG['host']}/services/search/jobs/{sid}"
+    """
+    Poll a Splunk search job until DONE then fetch results.
+    Includes a hard timeout of 10 minutes per job to prevent hanging.
+    Cancels the job if the timeout is exceeded.
+    """
+    url          = f"{SPLUNK_CONFIG['host']}/services/search/jobs/{sid}"
+    job_timeout  = 600   # 10 minutes max per Splunk job
+    elapsed      = 0
+    poll_interval = 5
+
     time.sleep(SPLUNK_CONFIG['initial_poll'])
+    elapsed += SPLUNK_CONFIG['initial_poll']
+
     while True:
+        if elapsed >= job_timeout:
+            logger.warning("Splunk job %s exceeded %ds timeout — cancelling.", sid, job_timeout)
+            try:
+                requests.delete(url, headers=_splunk_headers(), verify=False, timeout=10)
+            except Exception:
+                pass
+            raise RuntimeError(f"Splunk job {sid} timed out after {job_timeout}s")
+
         resp  = requests.get(url, headers=_splunk_headers(),
                              params={'output_mode': 'json'}, verify=False, timeout=30)
         resp.raise_for_status()
         state = resp.json()['entry'][0]['content']['dispatchState']
+
         if state == 'DONE':
             break
         elif state == 'FAILED':
             raise RuntimeError(f"Splunk job {sid} FAILED")
-        time.sleep(5)
+
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
     resp = requests.get(
         f"{SPLUNK_CONFIG['host']}/services/search/jobs/{sid}/results",
         headers=_splunk_headers(),
@@ -362,11 +417,12 @@ search index="lilly_infosec_proofpoint_education" ({ef})
 | rename attributes.eventtype        as eventtype
 | where lower(userIdentity) IN ({el})
 | where isnotnull(pf_os) AND pf_os != "" AND lower(pf_os) != "null"
-| where eventtype IN ("Email Click","Email View","Reported","TM Sent","Data Submission")
+| where eventtype IN ("Email Click","Data Submission","Attachment Open","Reported")
 | eval ts = strftime(_time, "%Y-%m-%dT%H:%M:%S")
 | sort 0 - _time
 | table ts, userIdentity, pf_os, pf_os_version, pf_ip, eventtype
 """.strip()
+    # Scoped to campaign window so Splunk only scans the relevant partition
     return q, campaign_earliest, campaign_latest
 
 
@@ -379,10 +435,13 @@ def _parse_azuread(raw: dict) -> dict:
             os_val = (r.get('splunk_os') or '').strip()
             if not dt or not os_val or os_val.lower() == 'null':
                 continue
-            parsed.append({'dt': dt, 'os': _normalize_os(os_val),
-                           'os_version': r.get('splunk_os_version', ''),
-                           'ip': r.get('callerIpAddress', ''),
-                           'ts': r.get('ts') or r.get('_time') or ''})
+            parsed.append({
+                'dt':         dt,
+                'os':         _normalize_os(os_val),
+                'os_version': r.get('splunk_os_version', ''),
+                'ip':         r.get('callerIpAddress', ''),
+                'ts':         r.get('ts') or r.get('_time') or '',
+            })
         if parsed:
             out[email] = parsed
     return out
@@ -397,11 +456,14 @@ def _parse_proofpoint_splunk(raw: dict) -> dict:
             os_val = (r.get('pf_os') or '').strip()
             if not dt or not os_val or os_val.lower() == 'null':
                 continue
-            parsed.append({'dt': dt, 'os': _normalize_os(os_val),
-                           'os_version': r.get('pf_os_version', ''),
-                           'ip': r.get('pf_ip', ''),
-                           'ts': r.get('ts') or r.get('_time') or '',
-                           'eventtype': r.get('eventtype', '')})
+            parsed.append({
+                'dt':         dt,
+                'os':         _normalize_os(os_val),
+                'os_version': r.get('pf_os_version', ''),
+                'ip':         r.get('pf_ip', ''),
+                'ts':         r.get('ts') or r.get('_time') or '',
+                'eventtype':  r.get('eventtype', ''),
+            })
         if parsed:
             out[email] = parsed
     return out
@@ -434,11 +496,11 @@ search index="lilly_infosec_azuread_diagnostics" category=SignInLogs resultSigna
                 os_val = _normalize_os((r.get('splunk_os') or '').strip())
                 if os_val and os_val.lower() != 'null':
                     results[email] = {
-                        'os':          os_val,
-                        'os_version':  r.get('splunk_os_version', ''),
-                        'ip':          r.get('callerIpAddress', ''),
-                        'ts':          r.get('ts', ''),
-                        'ts_source':   'retry→azuread',
+                        'os':         os_val,
+                        'os_version': r.get('splunk_os_version', ''),
+                        'ip':         r.get('callerIpAddress', ''),
+                        'ts':         r.get('ts', ''),
+                        'ts_source':  'retry→azuread',
                     }
                     logger.info("[%d/%d] %s ✓ %s", idx, total, email, os_val)
                 else:
@@ -481,8 +543,20 @@ def enrich_with_splunk_os(merged_df: pd.DataFrame,
         if str(row.get('Email Address') or '').strip()
         and row['_ts_source'] != 'no_action'
     ))
-    logger.info("%d active users | %d no-action users skipped.",
-                len(active_emails), len(rows) - len(active_emails))
+
+    skipped = len(rows) - len(active_emails)
+    logger.info(
+        "%d users will be queried in Splunk (failed/reported only) | "
+        "%d skipped (no-action / email-opened-only — no failure OS data available).",
+        len(active_emails), skipped,
+    )
+
+    if not active_emails:
+        logger.info("No users need Splunk enrichment. Skipping all phases.")
+        for col in ('splunk_lookup_timestamp', 'splunk_ts_source',
+                    'splunk_os', 'splunk_os_version', 'splunk_ip', 'splunk_ts'):
+            merged_df[col] = ''
+        return merged_df
 
     # ── Phase 1: Proofpoint Splunk ────────────────────────────────────
     logger.info("Phase 1 — Proofpoint Splunk for %d users...", len(active_emails))
@@ -549,32 +623,40 @@ def enrich_with_splunk_os(merged_df: pd.DataFrame,
         email     = str(row.get('Email Address') or '').strip().lower()
         src       = row['_ts_source']
         anchor_dt = row['_anchor_dt']
-        info      = {'splunk_os': '', 'splunk_os_version': '',
-                     'splunk_ip': '', 'splunk_ts': '', 'splunk_ts_source': ''}
+        info      = {
+            'splunk_os': '', 'splunk_os_version': '',
+            'splunk_ip': '', 'splunk_ts': '', 'splunk_ts_source': '',
+        }
 
         if src != 'no_action':
             pf_match = _closest_match(proofpoint.get(email, []), anchor_dt)
             if pf_match:
-                info = {'splunk_os':         pf_match['os'],
-                        'splunk_os_version': pf_match['os_version'],
-                        'splunk_ip':         pf_match['ip'],
-                        'splunk_ts':         pf_match['ts'],
-                        'splunk_ts_source':  f"proofpoint({pf_match['eventtype']})"}
+                info = {
+                    'splunk_os':         pf_match['os'],
+                    'splunk_os_version': pf_match['os_version'],
+                    'splunk_ip':         pf_match['ip'],
+                    'splunk_ts':         pf_match['ts'],
+                    'splunk_ts_source':  f"proofpoint({pf_match['eventtype']})",
+                }
             elif azuread.get(email):
                 az_match = _closest_match(azuread[email], anchor_dt)
                 if az_match:
-                    info = {'splunk_os':         az_match['os'],
-                            'splunk_os_version': az_match['os_version'],
-                            'splunk_ip':         az_match['ip'],
-                            'splunk_ts':         az_match['ts'],
-                            'splunk_ts_source':  src + '→azuread'}
+                    info = {
+                        'splunk_os':         az_match['os'],
+                        'splunk_os_version': az_match['os_version'],
+                        'splunk_ip':         az_match['ip'],
+                        'splunk_ts':         az_match['ts'],
+                        'splunk_ts_source':  src + '→azuread',
+                    }
             elif email in retry_results:
                 r = retry_results[email]
-                info = {'splunk_os':         r['os'],
-                        'splunk_os_version': r['os_version'],
-                        'splunk_ip':         r['ip'],
-                        'splunk_ts':         r['ts'],
-                        'splunk_ts_source':  r['ts_source']}
+                info = {
+                    'splunk_os':         r['os'],
+                    'splunk_os_version': r['os_version'],
+                    'splunk_ip':         r['ip'],
+                    'splunk_ts':         r['ts'],
+                    'splunk_ts_source':  r['ts_source'],
+                }
 
         merged_df.at[i, 'splunk_lookup_timestamp'] = row['_ts_str']
         merged_df.at[i, 'splunk_ts_source']        = info['splunk_ts_source']
@@ -1196,7 +1278,7 @@ def run_report_for_campaign(campaign: dict, workday_df: pd.DataFrame) -> bool:
     unmatched  = int(merged_df['GlobalId'].isna().sum())
     exec_count = int(merged_df['Executive Leadership'].sum()) \
                  if 'Executive Leadership' in merged_df.columns else 0
-    splunk_res = int((merged_df.get('splunk_os', pd.Series()) != '').sum()) \
+    splunk_res = int((merged_df.get('splunk_os', pd.Series(dtype=str)) != '').sum()) \
                  if 'splunk_os' in merged_df.columns else 0
 
     logger.info("Campaign complete: pp=%d fp=%d merged=%d matched=%d "
