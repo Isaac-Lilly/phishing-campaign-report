@@ -343,11 +343,14 @@ def enrich_via_azure_function(merged_df: pd.DataFrame,
     if not function_url:
         raise ValueError("AZURE_FUNCTION_URL is not set.")
 
-    payload = {
-        'merged_data':       merged_df.to_dict(orient='records'),
+    # Use pandas to_json to safely serialise NaN/inf values — unmatched Workday
+    # rows produce NaN in numeric columns which json.dumps rejects outright.
+    merged_json = merged_df.to_json(orient='records', date_format='iso')
+    body = json.dumps({
+        'merged_data':       json.loads(merged_json),
         'campaign_earliest': campaign_earliest,
         'campaign_latest':   campaign_latest,
-    }
+    })
 
     logger.info("Calling Azure Function for Splunk enrichment (%d rows)...", len(merged_df))
 
@@ -355,7 +358,7 @@ def enrich_via_azure_function(merged_df: pd.DataFrame,
         try:
             resp = requests.post(
                 function_url,
-                json=payload,
+                data=body,
                 timeout=2700,  # 45 minutes — matches Function App functionTimeout
                 headers={'Content-Type': 'application/json'},
             )
@@ -367,7 +370,7 @@ def enrich_via_azure_function(merged_df: pd.DataFrame,
             enriched_df = pd.DataFrame(enriched_records)
             logger.info("Azure Function returned %d enriched rows.", len(enriched_df))
             return enriched_df
-        except requests.RequestException as exc:
+        except (requests.RequestException, ValueError) as exc:
             wait = 30 * attempt
             logger.warning("Azure Function attempt %d/3 failed: %s — retry in %ds",
                            attempt, exc, wait)
