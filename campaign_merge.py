@@ -29,8 +29,6 @@ WORKDAY_CONFIG = {
 }
 
 PROOFPOINT_CONFIG = {
-    # Full URL to the phishing_extended endpoint e.g.:
-    # https://results.us.securityeducation.com/api/reporting/v0.3.0/phishing_extended
     'base_url':                os.getenv('PROOFPOINT_BASE_URL'),
     'api_key':                 os.getenv('PROOFPOINT_API_KEY'),
     'page_size':               int(os.getenv('PROOFPOINT_PAGE_SIZE', '500')),
@@ -43,26 +41,8 @@ PROOFPOINT_CONFIG = {
 }
 
 SHAREPOINT_CONFIG = {
-    # Power Automate HTTP trigger URL.
-    # file_type='excel' → ProofPoint_WorkDay_Splunk_Auto_Backup
-    # file_type='csv'   → Autopipeline_MasterReports
     'webhook_url':  os.getenv('POWER_AUTOMATE_WEBHOOK_URL'),
     'webhook_auth': os.getenv('POWER_AUTOMATE_WEBHOOK_AUTH', ''),
-}
-
-# Splunk — all campaign-specific date windows are computed dynamically
-# per campaign at runtime; these constants control query behaviour only.
-SPLUNK_CONFIG = {
-    'host':              os.getenv('SPLUNK_HOST', 'https://lilly-infosec.splunkcloud.com:8089'),
-    'token':             os.getenv('SPLUNK_API_KEY'),
-    'batch_size':        int(os.getenv('SPLUNK_BATCH_SIZE', '500')),
-    'submit_delay':      float(os.getenv('SPLUNK_SUBMIT_DELAY', '3')),
-    'max_retries':       int(os.getenv('SPLUNK_MAX_RETRIES', '5')),
-    'retry_delay':       float(os.getenv('SPLUNK_RETRY_DELAY', '10')),
-    'initial_poll':      float(os.getenv('SPLUNK_INITIAL_POLL', '5')),
-    'retry_job_delay':   float(os.getenv('SPLUNK_RETRY_JOB_DELAY', '3')),
-    # ±window around each user's anchor event when querying AzureAD
-    'time_window_mins':  int(os.getenv('SPLUNK_TIME_WINDOW_MINUTES', '1440')),
 }
 
 STATE_FILE             = os.getenv('STATE_FILE_PATH', 'campaign_state.json')
@@ -74,6 +54,8 @@ LOGGING_CONFIG = {
     'use_utc': os.getenv('LOG_USE_UTC', 'true').lower() == 'true',
 }
 
+# ── Ported from manual fetcher: FirstName and LastName added for obfuscated
+#    email resolution via name-matching against Workday.
 WORKDAY_FIELDS = [
     'Level5SupervioryOrganizationid', 'Level5SupervioryOrganizationdesc',
     'Level6SupervioryOrganizationid', 'Level6SupervioryOrganizationdesc',
@@ -84,6 +66,8 @@ WORKDAY_FIELDS = [
     'StatusDescription', 'Title', 'WorkCountryDescription', 'SupervisorGlobalId',
     'OnboardDate', 'RetirementDate', 'SupervisorEmail', 'SupervisorSystemId',
     'JobSubFunctionCode', 'JobSubFunctionDescription',
+    'PayGradeLevelCode', 'PayGradeLevelDescription',
+    'FirstName', 'LastName',  # required for resolve_obfuscated_emails()
 ]
 
 PROOFPOINT_FIELDS = [
@@ -201,475 +185,196 @@ def add_executive_leadership_column(df: pd.DataFrame) -> pd.DataFrame:
         logger.warning("'JobSubFunctionCode' not found — Executive Leadership set to False.")
     return df
 
-# ============================================
-# SPLUNK OS ENRICHMENT
-# ============================================
 
-def _splunk_headers() -> dict:
-    return {
-        'Authorization': f"Splunk {SPLUNK_CONFIG['token']}",
-        'Content-Type':  'application/x-www-form-urlencoded',
-    }
-
-
-def _splunk_parse_iso(ts):
-    """Parse a Splunk timestamp string to a naive datetime."""
-    if not ts or not str(ts).strip():
-        return None
-    ts = str(ts).strip().rstrip('Z')
-    for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M', '%Y-%m-%d',
-                '%m/%d/%Y %H:%M:%S', '%m/%d/%Y'):
-        try:
-            return datetime.strptime(ts, fmt)
-        except ValueError:
-            continue
-    return None
-
-
-def _splunk_time(dt) -> str:
-    return dt.strftime('%Y-%m-%dT%H:%M:%S')
-
-
-def _normalize_os(os_val: str) -> str:
+def compute_tenure(merged_df: pd.DataFrame, campaign_start_date: str) -> pd.DataFrame:
     """
-    Normalise raw OS string to a canonical name using a priority-ordered map.
-    First match wins.
+    Add a 'Tenure' column (in decimal years, rounded to 2 dp) to merged_df.
+
+    Logic:
+      - Reference date  = campaign_start_date (the campaign's start date)
+      - Anchor date     = ReHireDate if non-null, else HireDate
+      - Tenure (years)  = (reference_date - anchor_date).days / 365.25
+      - Negative tenures (hire date after campaign start) are left as-is so
+        data anomalies remain visible; consumers can filter them out.
+      - Rows where both HireDate and ReHireDate are null/unparseable get None.
     """
-    if not os_val or not str(os_val).strip():
-        return os_val or ''
-
-    os_lower = str(os_val).strip().lower()
-
-    OS_MAP = [
-        ('ipados',    'iPadOS'),
-        ('ios',       'iOS'),
-        ('android',   'Android'),
-        ('windows',   'Windows'),
-        ('mac os',    'macOS'),
-        ('macos',     'macOS'),
-        ('darwin',    'macOS'),
-        ('linux',     'Linux'),
-        ('ubuntu',    'Linux'),
-        ('debian',    'Linux'),
-        ('fedora',    'Linux'),
-        ('centos',    'Linux'),
-        ('chrome os', 'ChromeOS'),
-        ('chromeos',  'ChromeOS'),
-        ('cros',      'ChromeOS'),
-    ]
-    for keyword, canonical in OS_MAP:
-        if os_lower.startswith(keyword) or keyword in os_lower:
-            return canonical
-
-    return str(os_val).strip().title()
-
-
-def _resolve_anchor(row_dict: dict):
-    """
-    Returns (timestamp_str, source) for the most relevant FAILURE event.
-
-    Only users who actually FAILED (clicked, submitted data, opened
-    attachment) or REPORTED are worth querying Splunk for OS data.
-
-    Email-opened-only users and no-action users return ('', 'no_action')
-    and are skipped entirely — they have no failure-event OS data in Splunk.
-    """
-    reported        = str(row_dict.get('Reported') or '').strip().upper()
-    date_rep        = str(row_dict.get('Date Reported') or '').strip()
-    date_clicked    = str(row_dict.get('Date Clicked') or '').strip()
-    date_login      = str(row_dict.get('Date Login Compromised') or '').strip()
-    date_attachment = str(row_dict.get('Date Attachment Open') or '').strip()
-
-    if reported == 'TRUE' and date_rep:
-        return date_rep, 'date_reported'
-    elif date_clicked:
-        return date_clicked, 'date_clicked'
-    elif date_login:
-        return date_login, 'date_login_compromised'
-    elif date_attachment:
-        return date_attachment, 'date_attachment_open'
-    return '', 'no_action'
-
-
-def _closest_match(candidates: list, anchor_dt):
-    """Return the candidate closest in time to anchor_dt."""
-    if not candidates:
-        return None
-    if anchor_dt is None:
-        return max(candidates, key=lambda c: c['dt'])
-    window = timedelta(minutes=SPLUNK_CONFIG['time_window_mins'])
-    in_win = [c for c in candidates if abs(c['dt'] - anchor_dt) <= window]
-    pool   = in_win if in_win else candidates
-    return min(pool, key=lambda c: abs(c['dt'] - anchor_dt))
-
-
-def _submit_job(query: str, earliest: str, latest: str) -> str:
-    resp = requests.post(
-        f"{SPLUNK_CONFIG['host']}/services/search/jobs",
-        headers=_splunk_headers(),
-        data={'search': query, 'output_mode': 'json',
-              'earliest_time': earliest, 'latest_time': latest},
-        verify=False, timeout=120,
-    )
-    resp.raise_for_status()
-    return resp.json()['sid']
-
-
-def _poll_and_fetch(sid: str) -> list:
-    """
-    Poll a Splunk search job until DONE then fetch results.
-    Includes a hard timeout of 10 minutes per job to prevent hanging.
-    Cancels the job if the timeout is exceeded.
-    """
-    url          = f"{SPLUNK_CONFIG['host']}/services/search/jobs/{sid}"
-    job_timeout  = 600   # 10 minutes max per Splunk job
-    elapsed      = 0
-    poll_interval = 5
-
-    time.sleep(SPLUNK_CONFIG['initial_poll'])
-    elapsed += SPLUNK_CONFIG['initial_poll']
-
-    while True:
-        if elapsed >= job_timeout:
-            logger.warning("Splunk job %s exceeded %ds timeout — cancelling.", sid, job_timeout)
-            try:
-                requests.delete(url, headers=_splunk_headers(), verify=False, timeout=10)
-            except Exception:
-                pass
-            raise RuntimeError(f"Splunk job {sid} timed out after {job_timeout}s")
-
-        resp  = requests.get(url, headers=_splunk_headers(),
-                             params={'output_mode': 'json'}, verify=False, timeout=30)
-        resp.raise_for_status()
-        state = resp.json()['entry'][0]['content']['dispatchState']
-
-        if state == 'DONE':
-            break
-        elif state == 'FAILED':
-            raise RuntimeError(f"Splunk job {sid} FAILED")
-
-        time.sleep(poll_interval)
-        elapsed += poll_interval
-
-    resp = requests.get(
-        f"{SPLUNK_CONFIG['host']}/services/search/jobs/{sid}/results",
-        headers=_splunk_headers(),
-        params={'output_mode': 'json', 'count': 0},
-        verify=False, timeout=120,
-    )
-    resp.raise_for_status()
-    return resp.json().get('results', [])
-
-
-def _run_batches(batch_specs: list) -> dict:
-    """Execute a list of (query, earliest, latest, label) specs and collect results."""
-    raw   = defaultdict(list)
-    total = len(batch_specs)
-    for idx, (query, earliest, latest, label) in enumerate(batch_specs, 1):
-        for attempt in range(1, SPLUNK_CONFIG['max_retries'] + 1):
-            try:
-                sid  = _submit_job(query, earliest, latest)
-                rows = _poll_and_fetch(sid)
-                for r in rows:
-                    k = (r.get('userIdentity') or '').strip().lower()
-                    if k:
-                        raw[k].append(r)
-                logger.info("Splunk %d/%d done — %d users accumulated.", idx, total, len(raw))
-                time.sleep(SPLUNK_CONFIG['submit_delay'])
-                break
-            except Exception as exc:
-                wait = SPLUNK_CONFIG['retry_delay'] * (2 ** (attempt - 1))
-                logger.warning("%s attempt %d/%d: %s — retry in %.0fs",
-                               label, attempt, SPLUNK_CONFIG['max_retries'], exc, wait)
-                time.sleep(wait)
-                if attempt == SPLUNK_CONFIG['max_retries']:
-                    logger.error("%s failed after %d attempts — skipping.", label,
-                                 SPLUNK_CONFIG['max_retries'])
-    return dict(raw)
-
-
-def _azuread_query(emails: list, earliest: str, latest: str):
-    ef = ' OR '.join(f'"{e}"' for e in emails)
-    el = ', '.join(f'"{e.lower()}"' for e in emails)
-    q  = f"""
-search index="lilly_infosec_azuread_diagnostics" category=SignInLogs resultSignature=SUCCESS ({ef})
-| rename properties.userPrincipalName as userIdentity
-| rename properties.deviceDetail.operatingSystem as splunk_os
-| rename properties.deviceDetail.operatingSystemVersion as splunk_os_version
-| where lower(userIdentity) IN ({el})
-| where isnotnull(splunk_os) AND splunk_os != "" AND lower(splunk_os) != "null"
-| eval ts = strftime(_time, "%Y-%m-%dT%H:%M:%S")
-| sort 0 - _time
-| table ts, userIdentity, callerIpAddress, splunk_os, splunk_os_version
-""".strip()
-    return q, earliest, latest
-
-
-def _proofpoint_splunk_query(emails: list, campaign_earliest: str, campaign_latest: str):
-    ef = ' OR '.join(f'"{e}"' for e in emails)
-    el = ', '.join(f'"{e.lower()}"' for e in emails)
-    q  = f"""
-search index="lilly_infosec_proofpoint_education" ({ef})
-| rename attributes.useremailaddress as userIdentity
-| rename attributes.os               as pf_os
-| rename attributes.os_version       as pf_os_version
-| rename attributes.ip_address       as pf_ip
-| rename attributes.eventtype        as eventtype
-| where lower(userIdentity) IN ({el})
-| where isnotnull(pf_os) AND pf_os != "" AND lower(pf_os) != "null"
-| where eventtype IN ("Email Click","Data Submission","Attachment Open","Reported")
-| eval ts = strftime(_time, "%Y-%m-%dT%H:%M:%S")
-| sort 0 - _time
-| table ts, userIdentity, pf_os, pf_os_version, pf_ip, eventtype
-""".strip()
-    # Scoped to campaign window so Splunk only scans the relevant partition
-    return q, campaign_earliest, campaign_latest
-
-
-def _parse_azuread(raw: dict) -> dict:
-    out = {}
-    for email, rows in raw.items():
-        parsed = []
-        for r in rows:
-            dt     = _splunk_parse_iso(r.get('ts') or r.get('_time') or '')
-            os_val = (r.get('splunk_os') or '').strip()
-            if not dt or not os_val or os_val.lower() == 'null':
-                continue
-            parsed.append({
-                'dt':         dt,
-                'os':         _normalize_os(os_val),
-                'os_version': r.get('splunk_os_version', ''),
-                'ip':         r.get('callerIpAddress', ''),
-                'ts':         r.get('ts') or r.get('_time') or '',
-            })
-        if parsed:
-            out[email] = parsed
-    return out
-
-
-def _parse_proofpoint_splunk(raw: dict) -> dict:
-    out = {}
-    for email, rows in raw.items():
-        parsed = []
-        for r in rows:
-            dt     = _splunk_parse_iso(r.get('ts') or r.get('_time') or '')
-            os_val = (r.get('pf_os') or '').strip()
-            if not dt or not os_val or os_val.lower() == 'null':
-                continue
-            parsed.append({
-                'dt':         dt,
-                'os':         _normalize_os(os_val),
-                'os_version': r.get('pf_os_version', ''),
-                'ip':         r.get('pf_ip', ''),
-                'ts':         r.get('ts') or r.get('_time') or '',
-                'eventtype':  r.get('eventtype', ''),
-            })
-        if parsed:
-            out[email] = parsed
-    return out
-
-
-def _retry_single(unresolved_emails: list,
-                  campaign_earliest: str,
-                  campaign_latest: str) -> dict:
-    """Phase 3: single-email AzureAD queries for still-unresolved users."""
-    results = {}
-    total   = len(unresolved_emails)
-    logger.info("Phase 3: single-email retry for %d users...", total)
-    for idx, email in enumerate(unresolved_emails, 1):
-        q = f"""
-search index="lilly_infosec_azuread_diagnostics" category=SignInLogs resultSignature=SUCCESS "{email}"
-| rename properties.userPrincipalName as userIdentity
-| rename properties.deviceDetail.operatingSystem as splunk_os
-| rename properties.deviceDetail.operatingSystemVersion as splunk_os_version
-| where lower(userIdentity) = lower("{email}")
-| where isnotnull(splunk_os) AND splunk_os != "" AND lower(splunk_os) != "null"
-| eval ts = strftime(_time, "%Y-%m-%dT%H:%M:%S")
-| sort 0 - _time
-| table ts, userIdentity, callerIpAddress, splunk_os, splunk_os_version
-""".strip()
-        try:
-            sid  = _submit_job(q, campaign_earliest, campaign_latest)
-            rows = _poll_and_fetch(sid)
-            if rows:
-                r      = rows[0]
-                os_val = _normalize_os((r.get('splunk_os') or '').strip())
-                if os_val and os_val.lower() != 'null':
-                    results[email] = {
-                        'os':         os_val,
-                        'os_version': r.get('splunk_os_version', ''),
-                        'ip':         r.get('callerIpAddress', ''),
-                        'ts':         r.get('ts', ''),
-                        'ts_source':  'retry→azuread',
-                    }
-                    logger.info("[%d/%d] %s ✓ %s", idx, total, email, os_val)
-                else:
-                    logger.info("[%d/%d] %s — no OS found", idx, total, email)
-            else:
-                logger.info("[%d/%d] %s — no results", idx, total, email)
-        except Exception as exc:
-            logger.warning("[%d/%d] %s WARN: %s", idx, total, email, exc)
-        time.sleep(SPLUNK_CONFIG['retry_job_delay'])
-    return results
-
-
-def enrich_with_splunk_os(merged_df: pd.DataFrame,
-                          campaign_earliest: str,
-                          campaign_latest: str) -> pd.DataFrame:
-    """
-    Add Splunk OS columns to merged_df using a 3-phase lookup:
-      Phase 1 — Proofpoint Splunk index  (fastest, most accurate)
-      Phase 2 — AzureAD batch queries    (broader coverage)
-      Phase 3 — single-email retry       (last resort for stragglers)
-
-    campaign_earliest / campaign_latest define the Splunk search window
-    and are derived from the campaign's fetch date range.
-    No-action users (no clicked/opened/reported timestamps) are skipped.
-    """
-    logger.info("Starting Splunk OS enrichment for %d rows...", len(merged_df))
-
-    rows = merged_df.to_dict('records')
-
-    # Pre-compute anchors for every row
-    for row in rows:
-        ts_str, source    = _resolve_anchor(row)
-        row['_ts_str']    = ts_str
-        row['_ts_source'] = source
-        row['_anchor_dt'] = _splunk_parse_iso(ts_str)
-
-    active_emails = list(dict.fromkeys(
-        str(row.get('Email Address') or '').strip().lower()
-        for row in rows
-        if str(row.get('Email Address') or '').strip()
-        and row['_ts_source'] != 'no_action'
-    ))
-
-    skipped = len(rows) - len(active_emails)
-    logger.info(
-        "%d users will be queried in Splunk (failed/reported only) | "
-        "%d skipped (no-action / email-opened-only — no failure OS data available).",
-        len(active_emails), skipped,
-    )
-
-    if not active_emails:
-        logger.info("No users need Splunk enrichment. Skipping all phases.")
-        for col in ('splunk_lookup_timestamp', 'splunk_ts_source',
-                    'splunk_os', 'splunk_os_version', 'splunk_ip', 'splunk_ts'):
-            merged_df[col] = ''
+    try:
+        ref_date = _parse_date(campaign_start_date)
+    except ValueError as e:
+        logger.warning("compute_tenure: cannot parse campaign_start_date '%s': %s — "
+                       "Tenure set to None for all rows.", campaign_start_date, e)
+        merged_df['Tenure'] = None
         return merged_df
 
-    # ── Phase 1: Proofpoint Splunk ────────────────────────────────────
-    logger.info("Phase 1 — Proofpoint Splunk for %d users...", len(active_emails))
-    pf_specs = []
-    bs = SPLUNK_CONFIG['batch_size']
-    for i in range(0, len(active_emails), bs):
-        batch = active_emails[i:i + bs]
-        q, e, l = _proofpoint_splunk_query(batch, campaign_earliest, campaign_latest)
-        pf_specs.append((q, e, l, f"Proofpoint-{i}"))
-    pf_raw     = _run_batches(pf_specs)
-    proofpoint = _parse_proofpoint_splunk(pf_raw)
-    logger.info("Phase 1 resolved %d users.", len(proofpoint))
+    def _tenure_for_row(row):
+        for col in ('ReHireDate', 'HireDate'):
+            raw = row.get(col)
+            if raw and not pd.isna(raw) and str(raw).strip():
+                try:
+                    anchor = _parse_date(str(raw).strip())
+                    days   = (ref_date - anchor).days
+                    return round(days / 365.25, 2)
+                except ValueError:
+                    continue
+        return None
 
-    # ── Phase 2: AzureAD batch ────────────────────────────────────────
-    missing = [e for e in active_emails if e not in proofpoint]
-    logger.info("Phase 2 — AzureAD batch for %d users...", len(missing))
+    merged_df['Tenure'] = merged_df.apply(_tenure_for_row, axis=1)
 
-    email_windows = {}
-    date_buckets  = defaultdict(list)
-    for row in rows:
-        email = str(row.get('Email Address') or '').strip().lower()
-        if email not in missing:
-            continue
-        anchor = row['_anchor_dt']
-        tw     = timedelta(minutes=SPLUNK_CONFIG['time_window_mins'])
-        if anchor:
-            e      = _splunk_time(anchor - tw)
-            l      = _splunk_time(anchor + tw)
-            bucket = anchor.strftime('%Y-%m-%d')
-        else:
-            e, l   = campaign_earliest, campaign_latest
-            bucket = 'no_anchor'
-        email_windows[email] = (e, l)
-        date_buckets[bucket].append(email)
-
-    for k in date_buckets:
-        date_buckets[k] = list(dict.fromkeys(date_buckets[k]))
-
-    az_specs = []
-    for bucket, bemails in date_buckets.items():
-        windows  = [email_windows[em] for em in bemails]
-        earliest = min(w[0] for w in windows)
-        latest   = max(w[1] for w in windows)
-        for i in range(0, len(bemails), bs):
-            batch = bemails[i:i + bs]
-            q, e, l = _azuread_query(batch, earliest, latest)
-            az_specs.append((q, e, l, f"AzureAD-{bucket}-{i}"))
-
-    az_raw  = _run_batches(az_specs)
-    azuread = _parse_azuread(az_raw)
-    logger.info("Phase 2 resolved %d users.", len(azuread))
-
-    # ── Phase 3: single-email retry ───────────────────────────────────
-    still_missing = [e for e in active_emails if e not in proofpoint and e not in azuread]
-    retry_results = _retry_single(still_missing, campaign_earliest, campaign_latest)
-    logger.info("Phase 3 resolved %d users.", len(retry_results))
-
-    # ── Assemble columns ──────────────────────────────────────────────
-    for col in ('splunk_lookup_timestamp', 'splunk_ts_source',
-                'splunk_os', 'splunk_os_version', 'splunk_ip', 'splunk_ts'):
-        merged_df[col] = ''
-
-    for i, row in enumerate(rows):
-        email     = str(row.get('Email Address') or '').strip().lower()
-        src       = row['_ts_source']
-        anchor_dt = row['_anchor_dt']
-        info      = {
-            'splunk_os': '', 'splunk_os_version': '',
-            'splunk_ip': '', 'splunk_ts': '', 'splunk_ts_source': '',
-        }
-
-        if src != 'no_action':
-            pf_match = _closest_match(proofpoint.get(email, []), anchor_dt)
-            if pf_match:
-                info = {
-                    'splunk_os':         pf_match['os'],
-                    'splunk_os_version': pf_match['os_version'],
-                    'splunk_ip':         pf_match['ip'],
-                    'splunk_ts':         pf_match['ts'],
-                    'splunk_ts_source':  f"proofpoint({pf_match['eventtype']})",
-                }
-            elif azuread.get(email):
-                az_match = _closest_match(azuread[email], anchor_dt)
-                if az_match:
-                    info = {
-                        'splunk_os':         az_match['os'],
-                        'splunk_os_version': az_match['os_version'],
-                        'splunk_ip':         az_match['ip'],
-                        'splunk_ts':         az_match['ts'],
-                        'splunk_ts_source':  src + '→azuread',
-                    }
-            elif email in retry_results:
-                r = retry_results[email]
-                info = {
-                    'splunk_os':         r['os'],
-                    'splunk_os_version': r['os_version'],
-                    'splunk_ip':         r['ip'],
-                    'splunk_ts':         r['ts'],
-                    'splunk_ts_source':  r['ts_source'],
-                }
-
-        merged_df.at[i, 'splunk_lookup_timestamp'] = row['_ts_str']
-        merged_df.at[i, 'splunk_ts_source']        = info['splunk_ts_source']
-        merged_df.at[i, 'splunk_os']               = info['splunk_os']
-        merged_df.at[i, 'splunk_os_version']       = info['splunk_os_version']
-        merged_df.at[i, 'splunk_ip']               = info['splunk_ip']
-        merged_df.at[i, 'splunk_ts']               = info['splunk_ts']
-
-    resolved  = int((merged_df['splunk_os'] != '').sum())
-    no_action = int((merged_df['splunk_ts_source'] == '').sum())
-    logger.info("Splunk enrichment complete: resolved=%d no_action=%d unresolved=%d",
-                resolved, no_action, len(merged_df) - resolved - no_action)
+    resolved   = int(merged_df['Tenure'].notna().sum())
+    unresolved = len(merged_df) - resolved
+    logger.info("Tenure computed: resolved=%d unresolved=%d (ref_date=%s, "
+                "anchor=ReHireDate if set, else HireDate).",
+                resolved, unresolved, ref_date)
     return merged_df
+
+# ============================================
+# OBFUSCATED EMAIL RESOLUTION
+# Ported from manual fetcher.
+# ============================================
+
+def resolve_obfuscated_emails(proofpoint_df: pd.DataFrame,
+                               workday_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For every Proofpoint row whose 'Email Address' ends in '@obfuscated.invalid',
+    attempt to find a matching Workday record by (FirstName, LastName) and
+    replace the placeholder with the real InternetEmailAddress from Workday.
+    All other Proofpoint columns remain untouched; the corrected email then
+    joins correctly in the subsequent merge step.
+
+    Matching rules:
+      - Case-insensitive, whitespace-stripped comparison on both name fields.
+      - Exactly ONE Workday match  → replace email, mark resolved.
+      - Zero matches               → log warning, leave placeholder.
+      - Multiple matches           → log warning, leave placeholder (ambiguous).
+
+    Adds column 'Email Resolved From Obfuscated' (TRUE/FALSE) so downstream
+    consumers can identify which rows were resolved this way.
+
+    Requires FirstName and LastName in WORKDAY_FIELDS (already added above).
+    """
+    proofpoint_df = proofpoint_df.copy()
+    proofpoint_df['Email Resolved From Obfuscated'] = 'FALSE'
+
+    obfuscated_mask = (
+        proofpoint_df['Email Address']
+        .str.lower()
+        .str.strip()
+        .str.endswith('@obfuscated.invalid', na=False)
+    )
+    obfuscated_rows = proofpoint_df[obfuscated_mask]
+
+    if obfuscated_rows.empty:
+        logger.info("No obfuscated email addresses found in Proofpoint data.")
+        return proofpoint_df
+
+    logger.info("Obfuscated email resolution: %d rows to process.", len(obfuscated_rows))
+
+    workday_name_map: dict = defaultdict(list)
+    for _, wd_row in workday_df.iterrows():
+        first = str(wd_row.get('FirstName')  or '').strip().lower()
+        last  = str(wd_row.get('LastName')   or '').strip().lower()
+        email = str(wd_row.get('InternetEmailAddress') or '').strip()
+        if first and last and email:
+            workday_name_map[(first, last)].append(email)
+
+    resolved_count  = 0
+    ambiguous_count = 0
+    notfound_count  = 0
+
+    for idx in obfuscated_rows.index:
+        pp_first   = str(proofpoint_df.at[idx, 'First Name'] or '').strip().lower()
+        pp_last    = str(proofpoint_df.at[idx, 'Last Name']  or '').strip().lower()
+        orig_email = proofpoint_df.at[idx, 'Email Address']
+
+        if not pp_first or not pp_last:
+            logger.warning(
+                "Row %d: obfuscated email '%s' has blank name fields — cannot resolve.",
+                idx, orig_email,
+            )
+            notfound_count += 1
+            continue
+
+        matches = workday_name_map.get((pp_first, pp_last), [])
+
+        if len(matches) == 1:
+            proofpoint_df.at[idx, 'Email Address'] = matches[0]
+            proofpoint_df.at[idx, 'Email Resolved From Obfuscated'] = 'TRUE'
+            logger.info("Row %d: resolved '%s' → '%s'  (name: %s %s)",
+                        idx, orig_email, matches[0],
+                        pp_first.title(), pp_last.title())
+            resolved_count += 1
+        elif len(matches) > 1:
+            logger.warning(
+                "Row %d: '%s' matches %d Workday records for '%s %s' — ambiguous.",
+                idx, orig_email, len(matches), pp_first.title(), pp_last.title())
+            ambiguous_count += 1
+        else:
+            logger.warning(
+                "Row %d: '%s' — no Workday record for '%s %s' — leaving placeholder.",
+                idx, orig_email, pp_first.title(), pp_last.title())
+            notfound_count += 1
+
+    logger.info(
+        "Obfuscated email resolution complete: resolved=%d ambiguous=%d not_found=%d",
+        resolved_count, ambiguous_count, notfound_count,
+    )
+    return proofpoint_df
+
+# ============================================
+# AZURE FUNCTION ENRICHMENT
+# ============================================
+
+
+def enrich_via_azure_function(merged_df: pd.DataFrame,
+                               campaign_earliest: str,
+                               campaign_latest: str) -> pd.DataFrame:
+    """
+    POST merged_df to the Azure Function App (func-splunk-proxy) for Splunk
+    OS enrichment. The Function App runs inside a static-IP VNet so its
+    outbound IPs can be whitelisted in Splunk.
+
+    Set the AZURE_FUNCTION_URL secret to:
+      https://func-splunk-proxy.azurewebsites.net/api/splunk_enrich?code=<key>
+
+    Retries 3 times with a 30-second back-off before raising.
+    Timeout is 45 minutes (matching the Function App's functionTimeout).
+    """
+    function_url = os.getenv('AZURE_FUNCTION_URL')
+    if not function_url:
+        raise ValueError("AZURE_FUNCTION_URL is not set.")
+
+    payload = {
+        'merged_data':       merged_df.to_dict(orient='records'),
+        'campaign_earliest': campaign_earliest,
+        'campaign_latest':   campaign_latest,
+    }
+
+    logger.info("Calling Azure Function for Splunk enrichment (%d rows)...", len(merged_df))
+
+    for attempt in range(1, 4):
+        try:
+            resp = requests.post(
+                function_url,
+                json=payload,
+                timeout=2700,  # 45 minutes — matches Function App functionTimeout
+                headers={'Content-Type': 'application/json'},
+            )
+            resp.raise_for_status()
+            enriched_records = resp.json()
+            if not isinstance(enriched_records, list):
+                raise ValueError(f"Unexpected response type from Azure Function: "
+                                 f"{type(enriched_records)}")
+            enriched_df = pd.DataFrame(enriched_records)
+            logger.info("Azure Function returned %d enriched rows.", len(enriched_df))
+            return enriched_df
+        except requests.RequestException as exc:
+            wait = 30 * attempt
+            logger.warning("Azure Function attempt %d/3 failed: %s — retry in %ds",
+                           attempt, exc, wait)
+            if attempt < 3:
+                time.sleep(wait)
+
+    raise RuntimeError("Azure Function enrichment failed after 3 attempts.")
 
 # ============================================
 # SHAREPOINT UPLOAD  (via Power Automate HTTP trigger)
@@ -732,11 +437,6 @@ def upload_to_sharepoint(file_bytes: bytes, filename: str, file_type: str):
 # ============================================
 
 def discover_campaigns_from_phishing_extended() -> list:
-    """
-    Discover unique campaigns without fetching all event rows.
-    Uses includenoaction=FALSE to reduce volume, stops early when a full
-    page returns zero new guids, and hard-caps at discovery_max_pages.
-    """
     lookback_days = PROOFPOINT_CONFIG['discovery_lookback_days']
     max_pages     = PROOFPOINT_CONFIG['discovery_max_pages']
     today         = datetime.now(tz=timezone.utc).date()
@@ -841,8 +541,8 @@ def sync_pending_campaigns(state: dict) -> dict:
         logger.warning("No campaigns discovered — skipping sync.")
         return state
 
-    processed   = set(state.get('processed_guids', []))
-    pending_ids = {c['guid'] for c in state.get('pending_campaigns', [])}
+    processed    = set(state.get('processed_guids', []))
+    pending_ids  = {c['guid'] for c in state.get('pending_campaigns', [])}
     newly_queued = 0
 
     for c in campaigns:
@@ -914,6 +614,11 @@ def get_workday_access_token() -> str:
 
 
 def fetch_workday_workers(campaign_start_date: str) -> list:
+    """
+    Fetch all active or recently-terminated workers from Workday.
+    Pulls all WORKDAY_FIELDS including FirstName, LastName (required for
+    resolve_obfuscated_emails()), PayGradeLevelCode and PayGradeLevelDescription.
+    """
     logger.info("Fetching Workday workers (active OR terminated >= %s)...", campaign_start_date)
     token   = get_workday_access_token()
     headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
@@ -1007,20 +712,10 @@ def fetch_proofpoint_records(start_date: str, end_date: str) -> list:
     return all_records
 
 # ============================================
-# PROOFPOINT TRANSFORM  (with all bug fixes)
+# PROOFPOINT TRANSFORM
 # ============================================
 
 def transform_proofpoint_data(records: list) -> list:
-    """
-    Bug fixes included vs original script:
-      1. False positive also clears failure_condition (not just primary_clicked)
-         so Passed? is correctly TRUE for false-positive clicks.
-      2. Hardened campaigntype matching — strips whitespace, lowercases,
-         handles 'data entry' as alias for 'data entry campaign'.
-      3. Whois fields only populated from failure events (click/submission/
-         attachment) — not from email views, matching Proofpoint UI behaviour.
-      4. Unknown campaigntype falls back to: failed if ANY failure event exists.
-    """
     logger.info("Transforming Proofpoint data...")
     grouped = defaultdict(list)
     for r in records:
@@ -1044,7 +739,6 @@ def transform_proofpoint_data(records: list) -> list:
         tm_done     = by_type('TM Complete')
         reported    = by_type('Reported')
 
-        # ── Bug fix 2: hardened campaigntype matching ─────────────────
         campaign_type_raw = (
             events[0].get('campaigntype')
             or first.get('campaigntype', '')
@@ -1063,7 +757,6 @@ def transform_proofpoint_data(records: list) -> list:
         elif campaign_type == 'attachment':
             failed = bool(attachments)
         else:
-            # ── Bug fix 4: safe fallback for unknown types ─────────────
             failed = bool(clicks) or bool(submissions) or bool(attachments)
             if campaign_type:
                 logger.warning(
@@ -1075,7 +768,6 @@ def transform_proofpoint_data(records: list) -> list:
                 logger.warning("campaigntype missing for user=%s campaign=%r — fallback applied.",
                                first.get('useremailaddress'), first.get('campaignname'))
 
-        # ── Bug fix 3: Whois only from failure events ─────────────────
         if clicks:
             whois_src = clicks[0]['attributes']
         elif submissions:
@@ -1083,7 +775,7 @@ def transform_proofpoint_data(records: list) -> list:
         elif attachments:
             whois_src = attachments[0]['attributes']
         else:
-            whois_src = {}   # no failure event — intentionally blank
+            whois_src = {}
 
         def first_attr(lst, key):
             return lst[0]['attributes'].get(key) if lst else None
@@ -1099,7 +791,7 @@ def transform_proofpoint_data(records: list) -> list:
         is_fp = is_false_positive(date_sent, date_clicked, whois_isp)
         if is_fp:
             primary_clicked = False
-            failed          = False   # Bug fix 1: clear failure for FP
+            failed          = False
             fp_count += 1
 
         transformed.append({
@@ -1151,8 +843,21 @@ def transform_proofpoint_data(records: list) -> list:
 # ============================================
 
 def merge_datasets(proofpoint_df: pd.DataFrame, workday_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Left-join Proofpoint records to Workday on email address.
+    Carries through 'Email Resolved From Obfuscated' if present (ported from
+    manual fetcher).
+    """
     logger.info("Merging Proofpoint and Workday datasets...")
-    pp = proofpoint_df[PROOFPOINT_FIELDS].copy()
+
+    # Carry through the obfuscated-resolution flag if it was added upstream
+    pp_cols = PROOFPOINT_FIELDS + (
+        ['Email Resolved From Obfuscated']
+        if 'Email Resolved From Obfuscated' in proofpoint_df.columns
+        else []
+    )
+
+    pp = proofpoint_df[pp_cols].copy()
     wd = workday_df[WORKDAY_FIELDS + ['Executive Leadership']].copy()
     pp['Email Address']        = pp['Email Address'].str.lower().str.strip()
     wd['InternetEmailAddress'] = wd['InternetEmailAddress'].str.lower().str.strip()
@@ -1172,10 +877,6 @@ def merge_datasets(proofpoint_df: pd.DataFrame, workday_df: pd.DataFrame) -> pd.
 def build_excel_bytes(workday_df: pd.DataFrame,
                       proofpoint_df: pd.DataFrame,
                       merged_df: pd.DataFrame) -> bytes:
-    """
-    3-sheet workbook → ProofPoint_WorkDay_Splunk_Auto_Backup.
-    Merged Data sheet includes Splunk OS enrichment columns.
-    """
     logger.info("Building Excel workbook in memory...")
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
@@ -1195,7 +896,6 @@ def build_excel_bytes(workday_df: pd.DataFrame,
 
 
 def build_csv_bytes(merged_df: pd.DataFrame) -> bytes:
-    """Flat CSV of Merged Data (with Splunk columns) → Autopipeline_MasterReports."""
     return merged_df.to_csv(index=False, encoding='utf-8').encode('utf-8')
 
 # ============================================
@@ -1206,12 +906,14 @@ def run_report_for_campaign(campaign: dict, workday_df: pd.DataFrame) -> bool:
     """
     Full pipeline for one campaign:
       1. Compute date window
-      2. Fetch + transform Proofpoint (with bug fixes)
+      2. Fetch + transform Proofpoint
       3. Filter to this guid only
-      4. Merge with Workday
-      5. Enrich with Splunk OS (3-phase lookup)
-      6. Build Excel (3 sheets incl. Splunk cols) + CSV (merged flat)
-      7. Upload both via Power Automate to separate SharePoint folders
+      4. Resolve obfuscated emails via Workday name-match  ← ported from manual fetcher
+      5. Merge with Workday
+      6. Compute Tenure
+      7. Splunk OS enrichment — Azure Function (primary) or direct (fallback)
+      8. Build Excel + CSV
+      9. Upload via Power Automate
     """
     guid  = campaign['guid']
     title = campaign['title']
@@ -1223,7 +925,6 @@ def run_report_for_campaign(campaign: dict, workday_df: pd.DataFrame) -> bool:
     # ── 1. Date window ────────────────────────────────────────────────
     fetch_start, fetch_end = compute_date_range(campaign)
 
-    # Splunk uses the same window (ISO datetime strings)
     splunk_earliest = f"{fetch_start}T00:00:00"
     splunk_latest   = f"{fetch_end}T23:59:59"
 
@@ -1247,17 +948,30 @@ def run_report_for_campaign(campaign: dict, workday_df: pd.DataFrame) -> bool:
     logger.info("Records for this campaign: %d (of %d in date window).",
                 len(proofpoint_df), len(all_proofpoint_df))
 
-    # ── 4. Merge with Workday ─────────────────────────────────────────
+    # ── 4. Resolve obfuscated emails ─────────────────────────────────
+    # Rows ending in @obfuscated.invalid are matched to Workday by
+    # (First Name, Last Name) so downstream merge and Splunk steps use
+    # the real email address wherever possible.
+    proofpoint_df = resolve_obfuscated_emails(proofpoint_df, workday_df)
+
+    # ── 5. Merge with Workday ─────────────────────────────────────────
     merged_df = merge_datasets(proofpoint_df, workday_df)
     merged_df = merged_df[merged_df['Campaign Guid'] == guid].copy().reset_index(drop=True)
 
-    # ── 5. Splunk OS enrichment ───────────────────────────────────────
-    if SPLUNK_CONFIG['token']:
-        merged_df = enrich_with_splunk_os(merged_df, splunk_earliest, splunk_latest)
-    else:
-        logger.warning("SPLUNK_API_KEY not set — skipping Splunk OS enrichment.")
+    # ── 6. Compute Tenure ─────────────────────────────────────────────
+    merged_df = compute_tenure(merged_df, campaign['startDate'])
 
-    # ── 6. Build files ────────────────────────────────────────────────
+    # ── 7. Splunk OS enrichment via Azure Function ────────────────────
+    # The Azure Function App proxies Splunk queries through a static IP
+    # whitelisted in Splunk. Direct Splunk calls from GitHub Actions are
+    # not supported — GitHub Actions IPs are dynamic and blocked by Splunk.
+    if os.getenv('AZURE_FUNCTION_URL'):
+        merged_df = enrich_via_azure_function(merged_df, splunk_earliest, splunk_latest)
+    else:
+        logger.warning("AZURE_FUNCTION_URL not set — skipping Splunk OS enrichment. "
+                       "Set the secret to enable OS enrichment.")
+
+    # ── 8. Build files ────────────────────────────────────────────────
     safe_title = _safe_filename(title)
     xlsx_name  = f"{safe_title}_{guid}.xlsx"
     csv_name   = f"{safe_title}_{guid}.csv"
@@ -1265,7 +979,7 @@ def run_report_for_campaign(campaign: dict, workday_df: pd.DataFrame) -> bool:
     xlsx_bytes = build_excel_bytes(workday_df, proofpoint_df, merged_df)
     csv_bytes  = build_csv_bytes(merged_df)
 
-    # ── 7. Upload via Power Automate ──────────────────────────────────
+    # ── 9. Upload via Power Automate ──────────────────────────────────
     logger.info("Uploading Excel → ProofPoint_WorkDay_Splunk_Auto_Backup")
     upload_to_sharepoint(xlsx_bytes, xlsx_name, file_type='excel')
 
@@ -1274,17 +988,23 @@ def run_report_for_campaign(campaign: dict, workday_df: pd.DataFrame) -> bool:
 
     # ── Summary ───────────────────────────────────────────────────────
     fp_count   = int((proofpoint_df['False Positive'] == 'TRUE').sum())
+    obfusc_res = int(
+        (proofpoint_df.get('Email Resolved From Obfuscated',
+                           pd.Series(dtype=str)) == 'TRUE').sum()
+    )
     matched    = int(merged_df['GlobalId'].notna().sum())
     unmatched  = int(merged_df['GlobalId'].isna().sum())
     exec_count = int(merged_df['Executive Leadership'].sum()) \
                  if 'Executive Leadership' in merged_df.columns else 0
     splunk_res = int((merged_df.get('splunk_os', pd.Series(dtype=str)) != '').sum()) \
                  if 'splunk_os' in merged_df.columns else 0
+    tenure_res = int(merged_df['Tenure'].notna().sum()) \
+                 if 'Tenure' in merged_df.columns else 0
 
-    logger.info("Campaign complete: pp=%d fp=%d merged=%d matched=%d "
-                "unmatched=%d exec=%d splunk_resolved=%d",
-                len(proofpoint_df), fp_count, len(merged_df),
-                matched, unmatched, exec_count, splunk_res)
+    logger.info("Campaign complete: pp=%d fp=%d obfusc_resolved=%d merged=%d "
+                "matched=%d unmatched=%d exec=%d splunk_resolved=%d tenure_resolved=%d",
+                len(proofpoint_df), fp_count, obfusc_res, len(merged_df),
+                matched, unmatched, exec_count, splunk_res, tenure_res)
     logger.info("Excel → ProofPoint_WorkDay_Splunk_Auto_Backup/%s", xlsx_name)
     logger.info("CSV   → Autopipeline_MasterReports/%s", csv_name)
     return True

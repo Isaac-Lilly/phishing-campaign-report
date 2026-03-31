@@ -12,11 +12,10 @@ jobs:
   generate-report:
     name: Daily Campaign Report
     runs-on: ubuntu-latest
-    # Increased from 60 to 240 minutes.
-    # Splunk enrichment runs 3 phases of batch queries against AzureAD and
-    # Proofpoint indexes. For a large campaign (5,000+ users) this can take
-    # 60-90 minutes on its own. 240 minutes gives comfortable headroom.
-    timeout-minutes: 240
+    # Splunk enrichment now runs inside the Azure Function App.
+    # The Function App has a 45-minute timeout per invocation.
+    # 120 minutes gives headroom for multiple campaigns in one run.
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repository
@@ -46,14 +45,13 @@ jobs:
           PROOFPOINT_BASE_URL: ${{ secrets.PROOFPOINT_BASE_URL }}
           PROOFPOINT_API_KEY:  ${{ secrets.PROOFPOINT_API_KEY }}
 
-          # ── Splunk ────────────────────────────────────────────────
-          # SPLUNK_API_KEY is the only required Splunk secret.
-          # If not set, Splunk enrichment is skipped gracefully and
-          # the report is still generated without OS columns.
-          SPLUNK_API_KEY:  ${{ secrets.SPLUNK_API_KEY }}
-          # Host defaults to lilly-infosec.splunkcloud.com:8089 if not set.
-          # Only override this if your Splunk host has changed.
-          SPLUNK_HOST:     ${{ secrets.SPLUNK_HOST }}
+          # ── Azure Function (Splunk enrichment) ────────────────────
+          # The Function App proxies Splunk queries through a static IP
+          # whitelisted in lilly-infosec.splunkcloud.com:8089.
+          # Format: https://func-splunk-proxy.azurewebsites.net/api/splunk_enrich?code=<key>
+          # If not set, the pipeline falls back to direct Splunk queries
+          # (requires SPLUNK_API_KEY and GitHub Actions IPs whitelisted in Splunk).
+          AZURE_FUNCTION_URL: ${{ secrets.AZURE_FUNCTION_URL }}
 
           # ── Power Automate ────────────────────────────────────────
           # file_type='excel' → ProofPoint_WorkDay_Splunk_Auto_Backup
@@ -72,19 +70,6 @@ jobs:
           PROOFPOINT_DISCOVERY_MAX_PAGES:     '5'
           START_DATE_OFFSET_DAYS:             '-2'
           END_DATE_OFFSET_DAYS:               '3'
-
-          # ── Splunk tuning ─────────────────────────────────────────
-          # Batch size: number of emails per Splunk query (max 500)
-          SPLUNK_BATCH_SIZE:        '500'
-          # Seconds to wait between Splunk job submissions (avoid throttling)
-          SPLUNK_SUBMIT_DELAY:      '3'
-          SPLUNK_MAX_RETRIES:       '5'
-          SPLUNK_RETRY_DELAY:       '10'
-          SPLUNK_INITIAL_POLL:      '5'
-          SPLUNK_RETRY_JOB_DELAY:   '3'
-          # ±minutes around each user's anchor event for AzureAD lookup
-          # 1440 = ±24 hours. Widen if users sign in from different devices.
-          SPLUNK_TIME_WINDOW_MINUTES: '1440'
 
           # ── General ───────────────────────────────────────────────
           LOG_LEVEL:       'INFO'
