@@ -388,7 +388,7 @@ def enrich_via_azure_function(merged_df: pd.DataFrame,
 
     # Step 2 — poll status until complete (up to 50 minutes)
     poll_interval = 30
-    max_polls     = 100  # 100 × 30s = 50 minutes
+    max_polls     = 260  # 260 × 30s = 130 minutes (covers 2h functionTimeout)
     status_body   = json.dumps({'action': 'status', 'job_id': job_id})
 
     for poll in range(1, max_polls + 1):
