@@ -329,55 +329,103 @@ def enrich_via_azure_function(merged_df: pd.DataFrame,
                                campaign_earliest: str,
                                campaign_latest: str) -> pd.DataFrame:
     """
-    POST merged_df to the Azure Function App (func-splunk-proxy) for Splunk
-    OS enrichment. The Function App runs inside a static-IP VNet so its
-    outbound IPs can be whitelisted in Splunk.
+    Async pattern to work around the 230-second App Service HTTP timeout.
 
-    Set the AZURE_FUNCTION_URL secret to:
-      https://func-splunk-proxy.azurewebsites.net/api/splunk_enrich?code=<key>
+    Flow:
+      1. POST action='start' with the merged data → Function runs enrichment,
+         writes result blob, returns {"status":"complete","job_id":"..."}
+         If the function takes longer than the HTTP timeout a 504 is returned —
+         the pipeline then polls action='status' until the blob is ready.
+      2. Poll action='status' every 30s until {"status":"complete"}.
+      3. Fetch action='result' to get the enriched rows and delete the blob.
 
-    Retries 3 times with a 30-second back-off before raising.
-    Timeout is 45 minutes (matching the Function App's functionTimeout).
+    The Function App's functionTimeout is 45 minutes so even large campaigns
+    complete within a single invocation — the blob path handles the rare case
+    where the HTTP connection drops mid-run.
     """
     function_url = os.getenv('AZURE_FUNCTION_URL')
     if not function_url:
         raise ValueError("AZURE_FUNCTION_URL is not set.")
 
-    # Use pandas to_json to safely serialise NaN/inf values — unmatched Workday
-    # rows produce NaN in numeric columns which json.dumps rejects outright.
+    job_id = str(__import__('uuid').uuid4())
+
+    # Use pandas to_json to safely serialise NaN/inf values
     merged_json = merged_df.to_json(orient='records', date_format='iso')
-    body = json.dumps({
+    start_body = json.dumps({
+        'action':            'start',
+        'job_id':            job_id,
         'merged_data':       json.loads(merged_json),
         'campaign_earliest': campaign_earliest,
         'campaign_latest':   campaign_latest,
     })
 
-    logger.info("Calling Azure Function for Splunk enrichment (%d rows)...", len(merged_df))
+    logger.info("Azure Function job %s — submitting %d rows...", job_id, len(merged_df))
 
-    for attempt in range(1, 4):
+    # Step 1 — submit
+    try:
+        resp = requests.post(
+            function_url,
+            data=start_body,
+            timeout=240,  # slightly above the 230s App Service limit
+            headers={'Content-Type': 'application/json'},
+        )
+        if resp.status_code == 200:
+            result = resp.json()
+            if result.get('status') == 'complete':
+                logger.info("Azure Function completed synchronously for job %s.", job_id)
+                # fall through to fetch result
+            else:
+                raise RuntimeError(f"Unexpected start response: {result}")
+        elif resp.status_code == 504:
+            # HTTP connection timed out — function is still running, poll for result
+            logger.info("Azure Function HTTP timeout (504) — function still running. "
+                        "Polling for job %s...", job_id)
+        else:
+            resp.raise_for_status()
+    except requests.exceptions.Timeout:
+        logger.info("Azure Function HTTP connection timed out — function still running. "
+                    "Polling for job %s...", job_id)
+
+    # Step 2 — poll status until complete (up to 50 minutes)
+    poll_interval = 30
+    max_polls     = 100  # 100 × 30s = 50 minutes
+    status_body   = json.dumps({'action': 'status', 'job_id': job_id})
+
+    for poll in range(1, max_polls + 1):
+        time.sleep(poll_interval)
         try:
             resp = requests.post(
                 function_url,
-                data=body,
-                timeout=2700,  # 45 minutes — matches Function App functionTimeout
+                data=status_body,
+                timeout=30,
                 headers={'Content-Type': 'application/json'},
             )
             resp.raise_for_status()
-            enriched_records = resp.json()
-            if not isinstance(enriched_records, list):
-                raise ValueError(f"Unexpected response type from Azure Function: "
-                                 f"{type(enriched_records)}")
-            enriched_df = pd.DataFrame(enriched_records)
-            logger.info("Azure Function returned %d enriched rows.", len(enriched_df))
-            return enriched_df
-        except (requests.RequestException, ValueError) as exc:
-            wait = 30 * attempt
-            logger.warning("Azure Function attempt %d/3 failed: %s — retry in %ds",
-                           attempt, exc, wait)
-            if attempt < 3:
-                time.sleep(wait)
+            status = resp.json().get('status')
+            logger.info("Job %s poll %d/%d — status: %s", job_id, poll, max_polls, status)
+            if status == 'complete':
+                break
+        except requests.RequestException as exc:
+            logger.warning("Job %s status poll %d failed: %s", job_id, poll, exc)
+    else:
+        raise RuntimeError(f"Azure Function job {job_id} did not complete within 50 minutes.")
 
-    raise RuntimeError("Azure Function enrichment failed after 3 attempts.")
+    # Step 3 — fetch result
+    result_body = json.dumps({'action': 'result', 'job_id': job_id})
+    resp = requests.post(
+        function_url,
+        data=result_body,
+        timeout=60,
+        headers={'Content-Type': 'application/json'},
+    )
+    resp.raise_for_status()
+    enriched_records = resp.json()
+    if not isinstance(enriched_records, list):
+        raise ValueError(f"Unexpected result type from Azure Function: {type(enriched_records)}")
+
+    enriched_df = pd.DataFrame(enriched_records)
+    logger.info("Azure Function job %s complete — %d enriched rows.", job_id, len(enriched_df))
+    return enriched_df
 
 # ============================================
 # SHAREPOINT UPLOAD  (via Power Automate HTTP trigger)
