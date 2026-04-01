@@ -321,6 +321,78 @@ def resolve_obfuscated_emails(proofpoint_df: pd.DataFrame,
     return proofpoint_df
 
 # ============================================
+# OS ENRICHMENT HELPERS
+# ============================================
+
+def _normalize_os(os_val: str) -> str:
+    if not os_val or not str(os_val).strip():
+        return os_val or ''
+    os_lower = str(os_val).strip().lower()
+    OS_MAP = [
+        ('ipados',    'iPadOS'),
+        ('ios',       'iOS'),
+        ('android',   'Android'),
+        ('windows',   'Windows'),
+        ('mac os',    'macOS'),
+        ('macos',     'macOS'),
+        ('darwin',    'macOS'),
+        ('linux',     'Linux'),
+        ('ubuntu',    'Linux'),
+        ('debian',    'Linux'),
+        ('fedora',    'Linux'),
+        ('centos',    'Linux'),
+        ('chrome os', 'ChromeOS'),
+        ('chromeos',  'ChromeOS'),
+        ('cros',      'ChromeOS'),
+    ]
+    for keyword, canonical in OS_MAP:
+        if os_lower.startswith(keyword) or keyword in os_lower:
+            return canonical
+    return str(os_val).strip().title()
+
+
+def _fill_os_from_proofpoint_columns(merged_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Stage 1 of OS enrichment — fill splunk_os from Proofpoint columns already
+    present in the dataframe. No API calls needed.
+
+    Priority:
+      1. Clicked OS     → most relevant (device used to click the phishing link)
+      2. Email Opened OS → fallback (device that opened the email)
+
+    Never overwrites an existing splunk_os value. Sets splunk_ts_source to
+    'proofpoint_column(clicked_os)' or 'proofpoint_column(email_opened_os)'
+    so the data source is always transparent.
+    """
+    filled = 0
+    for i, row in merged_df.iterrows():
+        if str(row.get('splunk_os') or '').strip():
+            continue  # already resolved — never overwrite
+
+        clicked_os = str(row.get('Clicked OS') or '').strip()
+        if clicked_os and clicked_os.lower() not in ('', 'nan', 'none', 'null'):
+            merged_df.at[i, 'splunk_os']         = _normalize_os(clicked_os)
+            merged_df.at[i, 'splunk_os_version']  = str(row.get('Clicked OS Version') or '').strip()
+            merged_df.at[i, 'splunk_ip']          = str(row.get('Clicked IP Address') or '').strip()
+            merged_df.at[i, 'splunk_ts']          = str(row.get('Date Clicked') or '').strip()
+            merged_df.at[i, 'splunk_ts_source']   = 'proofpoint_column(clicked_os)'
+            filled += 1
+            continue
+
+        opened_os = str(row.get('Email Opened OS') or '').strip()
+        if opened_os and opened_os.lower() not in ('', 'nan', 'none', 'null'):
+            merged_df.at[i, 'splunk_os']         = _normalize_os(opened_os)
+            merged_df.at[i, 'splunk_os_version']  = str(row.get('Email Opened OS Version') or '').strip()
+            merged_df.at[i, 'splunk_ip']          = str(row.get('Email Opened IP Address') or '').strip()
+            merged_df.at[i, 'splunk_ts']          = str(row.get('Date Email Opened') or '').strip()
+            merged_df.at[i, 'splunk_ts_source']   = 'proofpoint_column(email_opened_os)'
+            filled += 1
+
+    logger.info("Stage 1 (Proofpoint columns): filled %d / %d rows.", filled, len(merged_df))
+    return merged_df
+
+
+# ============================================
 # AZURE FUNCTION ENRICHMENT
 # ============================================
 
@@ -425,7 +497,22 @@ def enrich_via_azure_function(merged_df: pd.DataFrame,
 
     enriched_df = pd.DataFrame(enriched_records)
     logger.info("Azure Function job %s complete — %d enriched rows.", job_id, len(enriched_df))
-    return enriched_df
+
+    # Merge Splunk results back without overwriting Stage 1 Proofpoint column values.
+    # The Function App may have set splunk_os for rows that Stage 1 left empty.
+    # For rows Stage 1 already filled, keep the existing values.
+    splunk_cols = ['splunk_os', 'splunk_os_version', 'splunk_ip', 'splunk_ts',
+                   'splunk_ts_source', 'splunk_lookup_timestamp']
+    for col in splunk_cols:
+        if col not in enriched_df.columns:
+            continue
+        if col not in merged_df.columns:
+            merged_df[col] = ''
+        # Only update rows where merged_df still has no OS value
+        empty_mask = merged_df['splunk_os'].astype(str).str.strip() == ''
+        merged_df.loc[empty_mask, col] = enriched_df.loc[empty_mask, col].values
+
+    return merged_df
 
 # ============================================
 # SHAREPOINT UPLOAD  (via Power Automate HTTP trigger)
@@ -1012,15 +1099,33 @@ def run_report_for_campaign(campaign: dict, workday_df: pd.DataFrame) -> bool:
     # ── 6. Compute Tenure ─────────────────────────────────────────────
     merged_df = compute_tenure(merged_df, campaign['startDate'])
 
-    # ── 7. Splunk OS enrichment via Azure Function ────────────────────
-    # The Azure Function App proxies Splunk queries through a static IP
-    # whitelisted in Splunk. Direct Splunk calls from GitHub Actions are
-    # not supported — GitHub Actions IPs are dynamic and blocked by Splunk.
+    # ── 7. OS enrichment — two stages ────────────────────────────────
+    # Stage 1: fill from Proofpoint columns already in the dataframe
+    # (Clicked OS → Email Opened OS). Instant, no API calls.
+    # Initialise output columns first so Stage 1 can write into them.
+    for _col in ('splunk_lookup_timestamp', 'splunk_ts_source',
+                 'splunk_os', 'splunk_os_version', 'splunk_ip', 'splunk_ts'):
+        merged_df[_col] = ''
+    merged_df = _fill_os_from_proofpoint_columns(merged_df)
+
+    # Stage 2: send only rows still missing OS to the Azure Function.
+    # The Function App runs Splunk queries for those users only, which
+    # reduces query volume and runtime significantly.
     if os.getenv('AZURE_FUNCTION_URL'):
-        merged_df = enrich_via_azure_function(merged_df, splunk_earliest, splunk_latest)
+        still_missing = int((merged_df['splunk_os'] == '').sum())
+        logger.info("Stage 2 (Azure Function): %d rows still need OS lookup.", still_missing)
+        if still_missing > 0:
+            merged_df = enrich_via_azure_function(merged_df, splunk_earliest, splunk_latest)
+        else:
+            logger.info("All rows resolved by Proofpoint columns — skipping Azure Function.")
     else:
-        logger.warning("AZURE_FUNCTION_URL not set — skipping Splunk OS enrichment. "
-                       "Set the secret to enable OS enrichment.")
+        logger.warning("AZURE_FUNCTION_URL not set — Splunk enrichment skipped. "
+                       "Only Proofpoint column OS data is available.")
+
+    stage1 = int((merged_df['splunk_ts_source'].str.startswith('proofpoint_column')).sum())
+    stage2 = int((merged_df['splunk_os'] != '').sum()) - stage1
+    logger.info("OS enrichment complete: proofpoint_column=%d splunk=%d total_resolved=%d",
+                stage1, stage2, stage1 + stage2)
 
     # ── 8. Build files ────────────────────────────────────────────────
     safe_title = _safe_filename(title)
