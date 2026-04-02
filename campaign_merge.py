@@ -145,7 +145,13 @@ def _parse_date(raw: str):
 
 
 def _safe_filename(text: str) -> str:
-    return ''.join(c if c.isalnum() or c in '-_ ' else '_' for c in str(text)).strip()
+    import re
+    # Replace anything that is not alphanumeric or hyphen with underscore
+    # (covers spaces, #, &, (, ), %, :, / and all other special characters)
+    s = re.sub(r'[^A-Za-z0-9\-]', '_', str(text))
+    # Collapse consecutive underscores and strip leading/trailing ones
+    s = re.sub(r'_+', '_', s)
+    return s.strip('_')
 
 
 def parse_timestamp(ts):
