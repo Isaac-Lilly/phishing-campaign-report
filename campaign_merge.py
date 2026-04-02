@@ -427,17 +427,25 @@ def enrich_via_azure_function(merged_df: pd.DataFrame,
 
     job_id = str(__import__('uuid').uuid4())
 
-    # Use pandas to_json to safely serialise NaN/inf values
-    merged_json = merged_df.to_json(orient='records', date_format='iso')
+    # Only send rows still missing OS — do not send the full merged_df.
+    # Sending 70k+ rows causes 502 Bad Gateway due to request body size limits.
+    # The function returns results only for the rows it was given; we merge
+    # them back into the full merged_df after the job completes.
+    missing_mask    = merged_df['splunk_os'].astype(str).str.strip() == ''
+    missing_df      = merged_df[missing_mask].reset_index(drop=True)
+    missing_indices = merged_df.index[missing_mask].tolist()
+
+    subset_json = missing_df.to_json(orient='records', date_format='iso')
     start_body = json.dumps({
         'action':            'start',
         'job_id':            job_id,
-        'merged_data':       json.loads(merged_json),
+        'merged_data':       json.loads(subset_json),
         'campaign_earliest': campaign_earliest,
         'campaign_latest':   campaign_latest,
     })
 
-    logger.info("Azure Function job %s — submitting %d rows...", job_id, len(merged_df))
+    logger.info("Azure Function job %s — submitting %d rows (of %d total, %d already resolved)...",
+                job_id, len(missing_df), len(merged_df), len(merged_df) - len(missing_df))
 
     # Step 1 — submit
     try:
@@ -504,9 +512,8 @@ def enrich_via_azure_function(merged_df: pd.DataFrame,
     enriched_df = pd.DataFrame(enriched_records)
     logger.info("Azure Function job %s complete — %d enriched rows.", job_id, len(enriched_df))
 
-    # Merge Splunk results back without overwriting Stage 1 Proofpoint column values.
-    # The Function App may have set splunk_os for rows that Stage 1 left empty.
-    # For rows Stage 1 already filled, keep the existing values.
+    # Merge Splunk results back into the original merged_df at the correct indices.
+    # enriched_df rows correspond 1-to-1 with missing_indices in merged_df.
     splunk_cols = ['splunk_os', 'splunk_os_version', 'splunk_ip', 'splunk_ts',
                    'splunk_ts_source', 'splunk_lookup_timestamp']
     for col in splunk_cols:
@@ -514,9 +521,9 @@ def enrich_via_azure_function(merged_df: pd.DataFrame,
             continue
         if col not in merged_df.columns:
             merged_df[col] = ''
-        # Only update rows where merged_df still has no OS value
-        empty_mask = merged_df['splunk_os'].astype(str).str.strip() == ''
-        merged_df.loc[empty_mask, col] = enriched_df.loc[empty_mask, col].values
+        for enriched_i, original_i in enumerate(missing_indices):
+            if enriched_i < len(enriched_df):
+                merged_df.at[original_i, col] = enriched_df.at[enriched_i, col]
 
     return merged_df
 
@@ -1099,11 +1106,12 @@ def build_csv_bytes(merged_df: pd.DataFrame) -> bytes:
 # PER-CAMPAIGN REPORT
 # ============================================
 
-def run_report_for_campaign(campaign: dict, workday_df: pd.DataFrame) -> bool:
+def run_report_for_campaign(campaign: dict, workday_df: pd.DataFrame,
+                             proofpoint_df_provider=None) -> bool:
     """
     Full pipeline for one campaign:
       1. Compute date window
-      2. Fetch + transform Proofpoint
+      2. Fetch + transform Proofpoint (via cache if proofpoint_df_provider supplied)
       3. Filter to this guid only
       4. Resolve obfuscated emails via Workday name-match  ← ported from manual fetcher
       5. Merge with Workday
@@ -1126,12 +1134,20 @@ def run_report_for_campaign(campaign: dict, workday_df: pd.DataFrame) -> bool:
     splunk_latest   = f"{fetch_end}T23:59:59"
 
     # ── 2. Fetch + transform Proofpoint ──────────────────────────────
-    pp_records = fetch_proofpoint_records(fetch_start, fetch_end)
-    if not pp_records:
+    # Use the shared cache if provided (avoids re-fetching for campaigns
+    # that share the same date window, e.g. all 4 January campaigns).
+    if proofpoint_df_provider is not None:
+        all_proofpoint_df = proofpoint_df_provider(fetch_start, fetch_end)
+    else:
+        pp_records = fetch_proofpoint_records(fetch_start, fetch_end)
+        if not pp_records:
+            logger.error("No Proofpoint records for campaign %s. Skipping.", guid)
+            return False
+        all_proofpoint_df = pd.DataFrame(transform_proofpoint_data(pp_records))
+
+    if all_proofpoint_df.empty:
         logger.error("No Proofpoint records for campaign %s. Skipping.", guid)
         return False
-
-    all_proofpoint_df = pd.DataFrame(transform_proofpoint_data(pp_records))
 
     # ── 3. Filter to this campaign guid ──────────────────────────────
     proofpoint_df = all_proofpoint_df[
@@ -1266,10 +1282,31 @@ def main():
         logger.info("Workday: %d records (shared across %d campaign(s)).",
                     len(workday_df), len(ready_campaigns))
 
+    # Pre-fetch Proofpoint data grouped by fetch window so campaigns that share
+    # the same date window (e.g. all 4 January campaigns) only hit the API once.
+    from collections import defaultdict as _defaultdict
+    window_cache: dict = {}  # (fetch_start, fetch_end) → all_proofpoint_df
+
+    def _get_proofpoint_df(fetch_start: str, fetch_end: str):
+        key = (fetch_start, fetch_end)
+        if key not in window_cache:
+            records = fetch_proofpoint_records(fetch_start, fetch_end)
+            if records:
+                window_cache[key] = pd.DataFrame(transform_proofpoint_data(records))
+            else:
+                window_cache[key] = pd.DataFrame()
+            logger.info("Proofpoint cache: window %s→%s stored (%d records).",
+                        fetch_start, fetch_end, len(window_cache[key]))
+        else:
+            logger.info("Proofpoint cache: reusing window %s→%s (%d records).",
+                        fetch_start, fetch_end, len(window_cache[key]))
+        return window_cache[key]
+
     succeeded, failed = [], []
     for campaign in ready_campaigns:
         try:
-            ok = run_report_for_campaign(campaign, workday_df)
+            ok = run_report_for_campaign(campaign, workday_df,
+                                         proofpoint_df_provider=_get_proofpoint_df)
             (succeeded if ok else failed).append(campaign['guid'])
         except Exception as e:
             logger.exception("Unhandled error for guid=%s: %s", campaign['guid'], e)
