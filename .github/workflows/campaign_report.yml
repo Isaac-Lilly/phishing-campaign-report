@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '0 6 * * *'   # daily at 06:00 UTC
   workflow_dispatch:        # manual trigger for testing
+    inputs:
+      backfill_from:
+        description: 'Backfill start date (YYYY-MM-DD). Leave blank for normal daily run.'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -13,8 +18,8 @@ jobs:
     name: Daily Campaign Report
     runs-on: ubuntu-latest
     # Splunk enrichment now runs inside the Azure Function App.
-    # The Function App has a 45-minute timeout per invocation.
-    # 120 minutes gives headroom for multiple campaigns in one run.
+    # The Function App has a 2-hour timeout per invocation.
+    # 360 minutes gives headroom for multiple campaigns in one run.
     timeout-minutes: 360
 
     steps:
@@ -49,8 +54,6 @@ jobs:
           # The Function App proxies Splunk queries through a static IP
           # whitelisted in lilly-infosec.splunkcloud.com:8089.
           # Format: https://func-splunk-proxy.azurewebsites.net/api/splunk_enrich?code=<key>
-          # If not set, the pipeline falls back to direct Splunk queries
-          # (requires SPLUNK_API_KEY and GitHub Actions IPs whitelisted in Splunk).
           AZURE_FUNCTION_URL: ${{ secrets.AZURE_FUNCTION_URL }}
 
           # ── Power Automate ────────────────────────────────────────
@@ -61,13 +64,20 @@ jobs:
           # Leave secret blank or unset if trigger is set to "Anyone".
           POWER_AUTOMATE_WEBHOOK_AUTH: ${{ secrets.POWER_AUTOMATE_WEBHOOK_AUTH }}
 
+          # ── Backfill ──────────────────────────────────────────────
+          # Set via workflow_dispatch input when running a manual backfill.
+          # Scans month-by-month from this date to today, ensuring all
+          # campaigns are discovered regardless of page limits.
+          # Leave blank for normal daily operation.
+          BACKFILL_FROM: ${{ github.event.inputs.backfill_from }}
+
           # ── Proofpoint tuning ─────────────────────────────────────
           PROOFPOINT_PAGE_SIZE:               '500'
           PROOFPOINT_RATE_LIMIT_DELAY:        '1.0'
           PROOFPOINT_RETRY_DELAY:             '5.0'
           PROOFPOINT_MAX_RETRIES:             '3'
-          PROOFPOINT_DISCOVERY_LOOKBACK_DAYS: '600'
-          PROOFPOINT_DISCOVERY_MAX_PAGES:     '100'
+          PROOFPOINT_DISCOVERY_LOOKBACK_DAYS: '40'
+          PROOFPOINT_DISCOVERY_MAX_PAGES:     '5'
           START_DATE_OFFSET_DAYS:             '-2'
           END_DATE_OFFSET_DAYS:               '3'
 

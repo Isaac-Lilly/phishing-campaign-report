@@ -580,19 +580,14 @@ def upload_to_sharepoint(file_bytes: bytes, filename: str, file_type: str):
 # CAMPAIGN DISCOVERY
 # ============================================
 
-def discover_campaigns_from_phishing_extended() -> list:
-    lookback_days = PROOFPOINT_CONFIG['discovery_lookback_days']
-    max_pages     = PROOFPOINT_CONFIG['discovery_max_pages']
-    today         = datetime.now(tz=timezone.utc).date()
-    scan_start    = (today - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
-    scan_end      = today.strftime('%Y-%m-%d')
-
-    logger.info("Discovering campaigns (lookback %d days: %s → %s, max %d page(s))...",
-                lookback_days, scan_start, scan_end, max_pages)
-
-    headers    = {'x-apikey-token': PROOFPOINT_CONFIG['api_key']}
-    page       = 1
-    seen_guids = {}
+def _scan_window(scan_start: str, scan_end: str, seen_guids: dict) -> dict:
+    """
+    Scan one date window against the Proofpoint API and accumulate
+    unique campaign GUIDs into seen_guids. Returns updated seen_guids.
+    """
+    max_pages = PROOFPOINT_CONFIG['discovery_max_pages']
+    headers   = {'x-apikey-token': PROOFPOINT_CONFIG['api_key']}
+    page      = 1
 
     while page <= max_pages:
         params = {
@@ -623,7 +618,6 @@ def discover_campaigns_from_phishing_extended() -> list:
                 page_data = data.get('data', [])
 
                 if not page_data:
-                    logger.info("Discovery: no more records on page %d. Stopping.", page)
                     page = max_pages + 1
                     break
 
@@ -651,11 +645,10 @@ def discover_campaigns_from_phishing_extended() -> list:
                     }
                     new_on_page += 1
 
-                logger.info("Discovery page %d: %d record(s), %d new guid(s) (total: %d).",
-                            page, len(page_data), new_on_page, len(seen_guids))
+                logger.info("  Window %s→%s page %d: %d record(s), %d new guid(s).",
+                            scan_start, scan_end, page, len(page_data), new_on_page)
 
                 if new_on_page == 0:
-                    logger.info("No new campaigns on page %d — stopping early.", page)
                     page = max_pages + 1
                     break
 
@@ -666,10 +659,70 @@ def discover_campaigns_from_phishing_extended() -> list:
                 logger.error("Discovery error (attempt %d/%d): %s",
                              attempt, PROOFPOINT_CONFIG['max_retries'], e)
                 if attempt == PROOFPOINT_CONFIG['max_retries']:
-                    return list(seen_guids.values())
+                    return seen_guids
                 time.sleep(PROOFPOINT_CONFIG['retry_delay'])
         else:
             break
+
+    return seen_guids
+
+
+def discover_campaigns_from_phishing_extended() -> list:
+    """
+    Discover campaigns from the Proofpoint API.
+
+    Normal mode: scan one window of PROOFPOINT_DISCOVERY_LOOKBACK_DAYS days.
+
+    Backfill mode: set BACKFILL_FROM env var to a date (e.g. '2025-01-01').
+    In backfill mode the function scans month-by-month from BACKFILL_FROM
+    to today, issuing one API call per month. This guarantees every campaign
+    in the backfill period is found regardless of page limits, because each
+    monthly window will never have more than a handful of campaigns.
+    """
+    today      = datetime.now(tz=timezone.utc).date()
+    seen_guids: dict = {}
+
+    backfill_from = os.getenv('BACKFILL_FROM', '').strip()
+
+    if backfill_from:
+        # ── Backfill mode: scan month by month ───────────────────────
+        try:
+            start_date = _parse_date(backfill_from)
+        except ValueError:
+            logger.error("BACKFILL_FROM='%s' is not a valid date — ignoring.", backfill_from)
+            start_date = today - timedelta(days=PROOFPOINT_CONFIG['discovery_lookback_days'])
+
+        # Build list of monthly windows from start_date to today
+        windows = []
+        cursor = start_date.replace(day=1)
+        while cursor <= today:
+            # Window start = 1st of month, end = last day of month (capped at today)
+            if cursor.month == 12:
+                next_month = cursor.replace(year=cursor.year + 1, month=1, day=1)
+            else:
+                next_month = cursor.replace(month=cursor.month + 1, day=1)
+            window_end = min(next_month - timedelta(days=1), today)
+            windows.append((cursor.strftime('%Y-%m-%d'), window_end.strftime('%Y-%m-%d')))
+            cursor = next_month
+
+        logger.info("Backfill mode: scanning %d monthly windows from %s to %s...",
+                    len(windows), backfill_from, today)
+
+        for w_start, w_end in windows:
+            logger.info("Scanning window: %s → %s", w_start, w_end)
+            seen_guids = _scan_window(w_start, w_end, seen_guids)
+
+    else:
+        # ── Normal mode: single lookback window ───────────────────────
+        lookback_days = PROOFPOINT_CONFIG['discovery_lookback_days']
+        scan_start    = (today - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
+        scan_end      = today.strftime('%Y-%m-%d')
+
+        logger.info("Discovering campaigns (lookback %d days: %s → %s, max %d page(s))...",
+                    lookback_days, scan_start, scan_end,
+                    PROOFPOINT_CONFIG['discovery_max_pages'])
+
+        seen_guids = _scan_window(scan_start, scan_end, seen_guids)
 
     campaigns = list(seen_guids.values())
     logger.info("Discovery complete: %d unique campaign(s).", len(campaigns))
