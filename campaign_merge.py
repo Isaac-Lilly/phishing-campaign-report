@@ -403,67 +403,40 @@ def _fill_os_from_proofpoint_columns(merged_df: pd.DataFrame) -> pd.DataFrame:
 # ============================================
 
 
-def enrich_via_azure_function(merged_df: pd.DataFrame,
-                               campaign_earliest: str,
-                               campaign_latest: str) -> pd.DataFrame:
+# Maximum rows per Azure Function job. Azure App Service has a 100MB request
+# body limit. At ~1KB per row, 5000 rows = ~5MB — well within the limit.
+AZURE_FUNCTION_BATCH_SIZE = int(os.getenv('AZURE_FUNCTION_BATCH_SIZE', '5000'))
+
+
+def _submit_and_poll(function_url: str, job_id: str, rows: list,
+                     campaign_earliest: str, campaign_latest: str) -> list:
     """
-    Async pattern to work around the 230-second App Service HTTP timeout.
-
-    Flow:
-      1. POST action='start' with the merged data → Function runs enrichment,
-         writes result blob, returns {"status":"complete","job_id":"..."}
-         If the function takes longer than the HTTP timeout a 504 is returned —
-         the pipeline then polls action='status' until the blob is ready.
-      2. Poll action='status' every 30s until {"status":"complete"}.
-      3. Fetch action='result' to get the enriched rows and delete the blob.
-
-    The Function App's functionTimeout is 45 minutes so even large campaigns
-    complete within a single invocation — the blob path handles the rare case
-    where the HTTP connection drops mid-run.
+    Submit one batch to the Azure Function and poll until complete.
+    Returns the enriched records as a list of dicts.
     """
-    function_url = os.getenv('AZURE_FUNCTION_URL')
-    if not function_url:
-        raise ValueError("AZURE_FUNCTION_URL is not set.")
-
-    job_id = str(__import__('uuid').uuid4())
-
-    # Only send rows still missing OS — do not send the full merged_df.
-    # Sending 70k+ rows causes 502 Bad Gateway due to request body size limits.
-    # The function returns results only for the rows it was given; we merge
-    # them back into the full merged_df after the job completes.
-    missing_mask    = merged_df['splunk_os'].astype(str).str.strip() == ''
-    missing_df      = merged_df[missing_mask].reset_index(drop=True)
-    missing_indices = merged_df.index[missing_mask].tolist()
-
-    subset_json = missing_df.to_json(orient='records', date_format='iso')
     start_body = json.dumps({
         'action':            'start',
         'job_id':            job_id,
-        'merged_data':       json.loads(subset_json),
+        'merged_data':       rows,
         'campaign_earliest': campaign_earliest,
         'campaign_latest':   campaign_latest,
     })
-
-    logger.info("Azure Function job %s — submitting %d rows (of %d total, %d already resolved)...",
-                job_id, len(missing_df), len(merged_df), len(merged_df) - len(missing_df))
 
     # Step 1 — submit
     try:
         resp = requests.post(
             function_url,
             data=start_body,
-            timeout=240,  # slightly above the 230s App Service limit
+            timeout=240,
             headers={'Content-Type': 'application/json'},
         )
         if resp.status_code == 200:
             result = resp.json()
             if result.get('status') == 'complete':
-                logger.info("Azure Function completed synchronously for job %s.", job_id)
-                # fall through to fetch result
+                logger.info("Azure Function job %s completed synchronously.", job_id)
             else:
                 raise RuntimeError(f"Unexpected start response: {result}")
         elif resp.status_code == 504:
-            # HTTP connection timed out — function is still running, poll for result
             logger.info("Azure Function HTTP timeout (504) — function still running. "
                         "Polling for job %s...", job_id)
         else:
@@ -472,20 +445,16 @@ def enrich_via_azure_function(merged_df: pd.DataFrame,
         logger.info("Azure Function HTTP connection timed out — function still running. "
                     "Polling for job %s...", job_id)
 
-    # Step 2 — poll status until complete (up to 50 minutes)
+    # Step 2 — poll
     poll_interval = 30
-    max_polls     = 260  # 260 × 30s = 130 minutes (covers 2h functionTimeout)
+    max_polls     = 260
     status_body   = json.dumps({'action': 'status', 'job_id': job_id})
 
     for poll in range(1, max_polls + 1):
         time.sleep(poll_interval)
         try:
-            resp = requests.post(
-                function_url,
-                data=status_body,
-                timeout=30,
-                headers={'Content-Type': 'application/json'},
-            )
+            resp = requests.post(function_url, data=status_body, timeout=30,
+                                 headers={'Content-Type': 'application/json'})
             resp.raise_for_status()
             status = resp.json().get('status')
             logger.info("Job %s poll %d/%d — status: %s", job_id, poll, max_polls, status)
@@ -494,26 +463,75 @@ def enrich_via_azure_function(merged_df: pd.DataFrame,
         except requests.RequestException as exc:
             logger.warning("Job %s status poll %d failed: %s", job_id, poll, exc)
     else:
-        raise RuntimeError(f"Azure Function job {job_id} did not complete within 50 minutes.")
+        raise RuntimeError(f"Azure Function job {job_id} did not complete within 130 minutes.")
 
     # Step 3 — fetch result
     result_body = json.dumps({'action': 'result', 'job_id': job_id})
-    resp = requests.post(
-        function_url,
-        data=result_body,
-        timeout=60,
-        headers={'Content-Type': 'application/json'},
-    )
+    resp = requests.post(function_url, data=result_body, timeout=60,
+                         headers={'Content-Type': 'application/json'})
     resp.raise_for_status()
-    enriched_records = resp.json()
-    if not isinstance(enriched_records, list):
-        raise ValueError(f"Unexpected result type from Azure Function: {type(enriched_records)}")
+    enriched = resp.json()
+    if not isinstance(enriched, list):
+        raise ValueError(f"Unexpected result type from Azure Function: {type(enriched)}")
+    return enriched
 
-    enriched_df = pd.DataFrame(enriched_records)
-    logger.info("Azure Function job %s complete — %d enriched rows.", job_id, len(enriched_df))
 
-    # Merge Splunk results back into the original merged_df at the correct indices.
-    # enriched_df rows correspond 1-to-1 with missing_indices in merged_df.
+def enrich_via_azure_function(merged_df: pd.DataFrame,
+                               campaign_earliest: str,
+                               campaign_latest: str) -> pd.DataFrame:
+    """
+    Submit missing-OS rows to the Azure Function in batches of
+    AZURE_FUNCTION_BATCH_SIZE (default 5000) to avoid 502 Bad Gateway
+    errors caused by the Azure App Service 100MB request body limit.
+
+    Each batch is a separate async job. Results are merged back into
+    merged_df without overwriting Stage 1 Proofpoint column values.
+    """
+    function_url = os.getenv('AZURE_FUNCTION_URL')
+    if not function_url:
+        raise ValueError("AZURE_FUNCTION_URL is not set.")
+
+    import uuid as _uuid
+
+    # Only send rows still missing OS
+    missing_mask    = merged_df['splunk_os'].astype(str).str.strip() == ''
+    missing_df      = merged_df[missing_mask].reset_index(drop=True)
+    missing_indices = merged_df.index[missing_mask].tolist()
+
+    total_missing = len(missing_df)
+    batch_size    = AZURE_FUNCTION_BATCH_SIZE
+    n_batches     = (total_missing + batch_size - 1) // batch_size
+
+    logger.info("Azure Function: %d rows need OS lookup — splitting into %d batch(es) of %d.",
+                total_missing, n_batches, batch_size)
+
+    # Collect enriched results in order
+    all_enriched: list = []
+
+    for batch_num in range(n_batches):
+        start_i = batch_num * batch_size
+        end_i   = min(start_i + batch_size, total_missing)
+        batch_df = missing_df.iloc[start_i:end_i]
+        job_id   = str(_uuid.uuid4())
+
+        batch_json = json.loads(batch_df.to_json(orient='records', date_format='iso'))
+
+        logger.info("Azure Function job %s — batch %d/%d — submitting %d rows (rows %d-%d of %d)...",
+                    job_id, batch_num + 1, n_batches, len(batch_df),
+                    start_i + 1, end_i, total_missing)
+
+        enriched = _submit_and_poll(function_url, job_id, batch_json,
+                                    campaign_earliest, campaign_latest)
+        all_enriched.extend(enriched)
+        logger.info("Batch %d/%d complete — %d rows enriched so far.",
+                    batch_num + 1, n_batches, len(all_enriched))
+
+    # Merge all batch results back into merged_df at the correct original indices.
+    # all_enriched is in the same order as missing_indices.
+    enriched_df = pd.DataFrame(all_enriched)
+    logger.info("All %d batch(es) complete — %d total enriched rows.",
+                n_batches, len(enriched_df))
+
     splunk_cols = ['splunk_os', 'splunk_os_version', 'splunk_ip', 'splunk_ts',
                    'splunk_ts_source', 'splunk_lookup_timestamp']
     for col in splunk_cols:
@@ -699,21 +717,32 @@ def discover_campaigns_from_phishing_extended() -> list:
             logger.error("BACKFILL_FROM='%s' is not a valid date — ignoring.", backfill_from)
             start_date = today - timedelta(days=PROOFPOINT_CONFIG['discovery_lookback_days'])
 
-        # Build list of monthly windows from start_date to today
+        backfill_to = os.getenv('BACKFILL_TO', '').strip()
+        if backfill_to:
+            try:
+                scan_end_date = _parse_date(backfill_to)
+                logger.info("Backfill end date capped at: %s", scan_end_date)
+            except ValueError:
+                logger.warning("BACKFILL_TO='%s' is not a valid date — using today.", backfill_to)
+                scan_end_date = today
+        else:
+            scan_end_date = today
+
+        # Build list of monthly windows from start_date to scan_end_date
         windows = []
         cursor = start_date.replace(day=1)
-        while cursor <= today:
+        while cursor <= scan_end_date:
             # Window start = 1st of month, end = last day of month (capped at today)
             if cursor.month == 12:
                 next_month = cursor.replace(year=cursor.year + 1, month=1, day=1)
             else:
                 next_month = cursor.replace(month=cursor.month + 1, day=1)
-            window_end = min(next_month - timedelta(days=1), today)
+            window_end = min(next_month - timedelta(days=1), scan_end_date)
             windows.append((cursor.strftime('%Y-%m-%d'), window_end.strftime('%Y-%m-%d')))
             cursor = next_month
 
         logger.info("Backfill mode: scanning %d monthly windows from %s to %s...",
-                    len(windows), backfill_from, today)
+                    len(windows), backfill_from, scan_end_date)
 
         for w_start, w_end in windows:
             logger.info("Scanning window: %s → %s", w_start, w_end)
@@ -1307,17 +1336,25 @@ def main():
         try:
             ok = run_report_for_campaign(campaign, workday_df,
                                          proofpoint_df_provider=_get_proofpoint_df)
-            (succeeded if ok else failed).append(campaign['guid'])
+            if ok:
+                succeeded.append(campaign['guid'])
+                # Save state immediately after each success so progress is
+                # preserved if the workflow is killed by the 6-hour timeout.
+                state['pending_campaigns'] = [
+                    c for c in state['pending_campaigns']
+                    if c['guid'] not in set(succeeded)
+                ]
+                state['processed_guids'] = list(
+                    set(state['processed_guids']) | set(succeeded)
+                )
+                save_state(state)
+                logger.info("State saved after guid=%s (%d processed so far).",
+                            campaign['guid'], len(state['processed_guids']))
+            else:
+                failed.append(campaign['guid'])
         except Exception as e:
             logger.exception("Unhandled error for guid=%s: %s", campaign['guid'], e)
             failed.append(campaign['guid'])
-
-    succeeded_set = set(succeeded)
-    state['pending_campaigns'] = [
-        c for c in state['pending_campaigns'] if c['guid'] not in succeeded_set
-    ]
-    state['processed_guids'].extend(succeeded)
-    save_state(state)
 
     logger.info("=" * 70)
     logger.info("DAILY RUN COMPLETE")

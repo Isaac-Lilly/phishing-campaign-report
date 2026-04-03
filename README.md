@@ -15,6 +15,8 @@ Every day, GitHub Actions runs `campaign_merge.py` which:
 5. Builds a 3-sheet Excel workbook and a flat CSV per campaign
 6. Uploads both files to SharePoint via Power Automate
 
+![Pipeline Architecture](PhishingPipeline_Architecture_v1.jpeg)
+
 ---
 
 ## Why an Azure Function App?
