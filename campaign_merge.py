@@ -633,7 +633,7 @@ def _scan_window(scan_start: str, scan_end: str, seen_guids: dict) -> dict:
                                     verify=PROOFPOINT_CONFIG['verify_ssl'])
 
                 if resp.status_code == 429:
-                    wait = int(resp.headers.get('Retry-After', PROOFPOINT_CONFIG['retry_delay']))
+                    wait = min(int(resp.headers.get('Retry-After', PROOFPOINT_CONFIG['retry_delay'])), 60)
                     logger.warning("429 Too Many Requests. Sleeping %ds.", wait)
                     time.sleep(wait)
                     continue
@@ -907,7 +907,7 @@ def fetch_proofpoint_records(start_date: str, end_date: str) -> list:
                                     params=params, timeout=30,
                                     verify=PROOFPOINT_CONFIG['verify_ssl'])
                 if resp.status_code == 429:
-                    wait = int(resp.headers.get('Retry-After', PROOFPOINT_CONFIG['retry_delay']))
+                    wait = min(int(resp.headers.get('Retry-After', PROOFPOINT_CONFIG['retry_delay'])), 60)
                     logger.warning("429 Too Many Requests. Sleeping %ds (attempt %d).", wait, attempt)
                     time.sleep(wait)
                     continue
