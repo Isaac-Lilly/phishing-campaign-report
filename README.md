@@ -6,6 +6,8 @@ Automated daily pipeline that fetches, enriches, and uploads phishing simulation
 
 ## Overview
 
+![Phishing Pipeline Architecture](PhishingPipeline_Architecture_v1.jpeg)
+
 Every day, GitHub Actions runs `campaign_merge.py` which:
 
 1. Discovers new phishing campaigns from the Proofpoint API
@@ -14,8 +16,6 @@ Every day, GitHub Actions runs `campaign_merge.py` which:
 4. Resolves OS data from Proofpoint columns and — for users where that is absent — from Splunk via an Azure Function App proxy
 5. Builds a 3-sheet Excel workbook and a flat CSV per campaign
 6. Uploads both files to SharePoint via Power Automate
-
-![Pipeline Architecture](PhishingPipeline_Architecture_v1.jpeg)
 
 ---
 
@@ -36,6 +36,10 @@ Azure App Service has a hard 230-second HTTP timeout on inbound connections. Spl
 | `result` | Downloads the result blob, returns enriched rows as JSON, deletes the blob. |
 
 The pipeline POSTs `action=start`, polls `action=status` every 30 seconds for up to 130 minutes, then fetches `action=result`.
+
+### Batching
+
+The Azure App Service has a 100MB request body limit. Large enterprise campaigns (70k+ rows) would exceed this and cause 502 errors. Rows requiring Splunk enrichment are split into batches of `AZURE_FUNCTION_BATCH_SIZE` rows (default: 5,000). Each batch is submitted as a separate async job and results are merged back in order.
 
 ---
 
@@ -62,25 +66,51 @@ Splunk results never overwrite Stage 1 values.
 phishing-campaign-report/
 ├── .github/
 │   └── workflows/
-│       └── phishing_report.yml   # Daily scheduled workflow
-├── campaign_merge.py             # Main pipeline script
-├── campaign_state.json           # Persisted run state (auto-updated by workflow)
-├── requirements.txt              # Python dependencies
+│       ├── phishing_report.yml    # Daily scheduled workflow
+│       └── phishing_backfill.yml  # Manual backfill workflow (date range input)
+├── campaign_merge.py              # Main pipeline script
+├── campaign_state.json            # Persisted run state (auto-updated by workflow)
+├── requirements.txt               # Python dependencies
 └── README.md
 ```
+
+---
+
+## Workflows
+
+### Daily — `phishing_report.yml`
+
+Runs automatically every day at 06:00 UTC. Scans the last `PROOFPOINT_DISCOVERY_LOOKBACK_DAYS` days (default: 40) for new campaigns, processes any that are ready, and commits the updated `campaign_state.json` back to the repository.
+
+Can also be triggered manually via **Actions → Phishing Campaign Report → Run workflow**.
+
+### Backfill — `phishing_backfill.yml`
+
+Manual trigger only. Used to process historical campaigns outside the normal lookback window. Accepts two inputs:
+
+| Input | Required | Description |
+|---|---|---|
+| `start_date` | Yes | Start of scan range, e.g. `2025-01-01` |
+| `end_date` | No | End of scan range. Defaults to today if blank. |
+
+The backfill scans month-by-month between the two dates, discovers all campaigns, and processes any not already in `processed_guids`. State is saved incrementally after each successful campaign so progress is preserved if the 6-hour GitHub Actions timeout is hit.
+
+To trigger: **Actions → Phishing Campaign Backfill → Run workflow**.
 
 ---
 
 ## campaign_state.json
 
 Persists across runs. Tracks:
-- `processed_guids` — campaigns that have been fully processed and uploaded. Never re-processed.
+- `processed_guids` — campaigns fully processed and uploaded. Never re-processed.
 - `pending_campaigns` — campaigns discovered but not yet ready (end date + 3-day buffer not reached).
 - `last_run_utc` — timestamp of the last run.
 
-The workflow commits this file back to the repository after each run with `[skip ci]` to avoid triggering a new workflow.
+The workflow commits this file back to the repository after each run using `if: always()` so it saves even when a campaign fails. State is also saved **incrementally** after each individual campaign succeeds, so a mid-run 6-hour timeout does not lose progress.
 
-A campaign is considered **ready** when today's date ≥ campaign end date + `END_DATE_OFFSET_DAYS` (default: 3). This ensures all participant data is finalised in Proofpoint before reporting.
+A campaign is considered **ready** when today ≥ campaign end date + `END_DATE_OFFSET_DAYS` (default: 3 days).
+
+To force re-processing of a specific campaign, remove its GUID from `processed_guids` and re-run.
 
 ---
 
@@ -103,10 +133,8 @@ Set these in **Settings → Secrets and variables → Actions**:
 
 | Secret | Description |
 |---|---|
-| `AZURE_CLIENT_ID` | OIDC app registration client ID |
-| `AZURE_TENANT_ID` | Azure AD tenant ID |
-| `SUBSCRIPTION_ID` | Azure subscription ID |
-| `AZURE_FUNCTION_URL` | Full Function App URL including `?code=` key — e.g. `https://func-splunk-proxy.azurewebsites.net/api/splunk_enrich?code=...` |
+| `AZURE_FUNCTION_URL` | Full Function App URL including `?code=` key |
+| `PROOFPOINT_BASE_URL` | Proofpoint Security Awareness API base URL |
 | `PROOFPOINT_API_KEY` | Proofpoint Security Awareness API key |
 | `WORKDAY_CLIENT_ID` | Workday OAuth2 client ID |
 | `WORKDAY_CLIENT_SECRET` | Workday OAuth2 client secret |
@@ -114,20 +142,20 @@ Set these in **Settings → Secrets and variables → Actions**:
 | `WORKDAY_API_URL` | Workday Workers OData API base URL |
 | `WORKDAY_SCOPE` | Workday OAuth2 scope |
 | `POWER_AUTOMATE_WEBHOOK_URL` | Power Automate HTTP trigger URL |
+| `POWER_AUTOMATE_WEBHOOK_AUTH` | Power Automate webhook auth header (if required) |
 
 ---
 
 ## Environment Variables (Optional Overrides)
 
-These can be set as repository variables or passed into the workflow to override defaults:
-
 | Variable | Default | Description |
 |---|---|---|
-| `PROOFPOINT_DISCOVERY_LOOKBACK_DAYS` | `14` | How many days back to scan for new campaigns |
+| `PROOFPOINT_DISCOVERY_LOOKBACK_DAYS` | `40` | Days back to scan for new campaigns (daily workflow) |
 | `END_DATE_OFFSET_DAYS` | `3` | Days after campaign end date before processing |
-| `START_DATE_OFFSET_DAYS` | `-2` | Days before campaign start date for Proofpoint fetch window |
-| `SPLUNK_TIME_WINDOW_MINUTES` | `1440` | AzureAD search window around anchor event (±minutes) |
-| `SPLUNK_BATCH_SIZE` | `500` | Emails per Splunk query batch |
+| `START_DATE_OFFSET_DAYS` | `-2` | Days before campaign start for Proofpoint fetch window |
+| `AZURE_FUNCTION_BATCH_SIZE` | `5000` | Max rows per Azure Function job |
+| `BACKFILL_FROM` | — | Set by backfill workflow. Triggers month-by-month scan from this date. |
+| `BACKFILL_TO` | — | Set by backfill workflow. Caps scan end date. Defaults to today if blank. |
 | `LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`) |
 
 ---
@@ -142,37 +170,25 @@ These can be set as repository variables or passed into the workflow to override
 | Runtime | Python 3.11 |
 | Plan | Standard S1 (Linux) — required for VNet integration and 2-hour `functionTimeout` |
 | VNet | `vnet-splunk` / subnet `snet-funcapp` (10.0.1.0/24) |
-| Storage | `stfuncsplunkproxy` — result blobs written to container `splunk-results` |
+| Storage | `stfuncsplunkproxy` — result blobs in container `splunk-results` |
 | `functionTimeout` | 2 hours (`00:02:00:00` in `host.json`) |
 
-### Function App Code
-
-The function app code is maintained separately in a local directory and deployed via Azure Functions Core Tools:
+### Deploying the Function App
 
 ```powershell
 cd C:\Users\L123065\splunk-proxy
 func azure functionapp publish func-splunk-proxy --python --force
 ```
 
-> The function key does not change when code is republished. `AZURE_FUNCTION_URL` remains valid across all deployments.
-
-
-## Failure & Retry Behaviour
-
-If a campaign fails for any reason (Splunk timeout, upload failure, etc.) it remains in `pending_campaigns` in `campaign_state.json` and is automatically retried on the next daily run. A campaign is only marked as permanently processed after a successful SharePoint upload.
-
-The workflow exits with code `1` if any campaign fails, which marks the GitHub Actions run as failed for visibility.
+> The function key does not change on republish. `AZURE_FUNCTION_URL` remains valid across all deployments.
 
 ---
 
-## Running Manually
+## Failure & Retry Behaviour
 
-To trigger the pipeline for a specific lookback window:
+If a campaign fails for any reason (Splunk timeout, 502 from the function, upload failure) it remains in `pending_campaigns` and is automatically retried on the next daily run. A campaign is only marked as permanently processed after a successful SharePoint upload.
 
-1. Go to **Actions → phishing-campaign-report → Run workflow**
-2. The workflow runs with all current secrets and the default lookback window
-
-To force re-processing of a specific campaign, remove its GUID from `processed_guids` in `campaign_state.json` and re-run.
+The workflow exits with code `1` if any campaign fails, marking the GitHub Actions run as failed for visibility. The state commit step runs regardless (`if: always()`), so progress is always saved.
 
 ---
 
