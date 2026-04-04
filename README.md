@@ -1,6 +1,6 @@
 # Automated Pipeline for Educational Phishing Campaign Reports
 
-Automated daily pipeline that fetches, enriches, and uploads phishing simulation campaign reports for Eli Lilly Information Security. Integrates Proofpoint Security Awareness, Workday, Splunk Cloud (via Azure Function App proxy), and SharePoint.
+Automated daily pipeline that fetches, enriches, and uploads phishing simulation campaign reports for Education Phishing (Eli Lilly Information Security). Integrates Proofpoint Security Awareness, Workday, Splunk Cloud (via Azure Function App proxy), and SharePoint.
 
 ---
 
@@ -13,7 +13,7 @@ Every day, GitHub Actions runs `campaign_merge.py` which:
 1. Discovers new phishing campaigns from the Proofpoint API
 2. Fetches all campaign participant records (every user sent, opened, clicked, reported)
 3. Enriches each record with Workday employee data (org hierarchy, tenure, pay grade)
-4. Resolves OS data from Proofpoint columns and — for users where that is absent — from Splunk via an Azure Function App proxy
+4. Resolves OS data from Proofpoint columns and — for failed/reported users where that is absent — from Splunk via an Azure Function App proxy
 5. Builds a 3-sheet Excel workbook and a flat CSV per campaign
 6. Uploads both files to SharePoint via Power Automate
 
@@ -45,13 +45,16 @@ The Azure App Service has a 100MB request body limit. Large enterprise campaigns
 
 ## OS Enrichment — Two Stages
 
-OS data is resolved in two stages. Stage 2 only runs for users Stage 1 could not resolve, minimising Splunk query volume.
+OS data is resolved in two stages. Only users who **failed** (clicked, submitted credentials, opened attachment) or **reported** the phishing email are enriched — sent/opened-only users are excluded from Splunk lookups as their OS is not relevant to the report.
 
 **Stage 1 — Proofpoint columns (instant, no API calls)**
-- Fill `splunk_os` from `Clicked OS` → `Email Opened OS` already present in the Proofpoint data
+- For every row, check if Proofpoint already returned OS data in `Clicked OS` or `Email Opened OS`
+- If found, populate `splunk_os` directly from those columns
 - `splunk_ts_source` is set to `proofpoint_column(clicked_os)` or `proofpoint_column(email_opened_os)`
 
-**Stage 2 — Azure Function / Splunk (only for rows still empty)**
+**Stage 2 — Azure Function / Splunk (failed/reported users only, where Stage 1 found nothing)**
+- Only rows where `Primary Clicked`, `Primary Compromised Login`, `Primary Attachment Open`, or `Reported` is TRUE — AND `splunk_os` is still empty — are sent to the function
+- Sent/opened-only users are skipped entirely, keeping Splunk query volume low
 - Phase 1: Proofpoint Splunk index (`lilly_infosec_proofpoint_education`) — failure events
 - Phase 2: AzureAD batch (`lilly_infosec_azuread_diagnostics`) — sign-in logs ±24h of click
 - Phase 3: Single-email AzureAD retry over the full campaign window
@@ -66,11 +69,12 @@ Splunk results never overwrite Stage 1 values.
 phishing-campaign-report/
 ├── .github/
 │   └── workflows/
-│       ├── phishing_report.yml    # Daily scheduled workflow
-│       └── phishing_backfill.yml  # Manual backfill workflow (date range input)
-├── campaign_merge.py              # Main pipeline script
-├── campaign_state.json            # Persisted run state (auto-updated by workflow)
-├── requirements.txt               # Python dependencies
+│       ├── phishing_report.yml     # Daily scheduled workflow
+│       ├── phishing_backfill.yml   # Manual backfill workflow (date range input)
+│       └── phishing_reprocess.yml  # Manual reprocess workflow (ignores processed_guids)
+├── campaign_merge.py               # Main pipeline script
+├── campaign_state.json             # Persisted run state (auto-updated by workflow)
+├── requirements.txt                # Python dependencies
 └── README.md
 ```
 
@@ -97,12 +101,25 @@ The backfill scans month-by-month between the two dates, discovers all campaigns
 
 To trigger: **Actions → Phishing Campaign Backfill → Run workflow**.
 
+### Reprocess — `phishing_reprocess.yml`
+
+Manual trigger only. Used to regenerate output files for campaigns that have already been processed, without modifying `campaign_state.json`. Accepts two inputs:
+
+| Input | Required | Description |
+|---|---|---|
+| `start_date` | Yes | Reprocess campaigns with `startDate` on or after this date |
+| `end_date` | Yes | Reprocess campaigns with `endDate` on or before this date |
+
+All campaigns in the date range are force-run regardless of whether their GUID is in `processed_guids`. State is not updated — `processed_guids` remains unchanged after a reprocess run.
+
+To trigger: **Actions → Phishing Campaign Reprocess → Run workflow**.
+
 ---
 
 ## campaign_state.json
 
 Persists across runs. Tracks:
-- `processed_guids` — campaigns fully processed and uploaded. Never re-processed.
+- `processed_guids` — campaigns fully processed and uploaded. Never re-processed by the daily or backfill workflows.
 - `pending_campaigns` — campaigns discovered but not yet ready (end date + 3-day buffer not reached).
 - `last_run_utc` — timestamp of the last run.
 
@@ -110,7 +127,7 @@ The workflow commits this file back to the repository after each run using `if: 
 
 A campaign is considered **ready** when today ≥ campaign end date + `END_DATE_OFFSET_DAYS` (default: 3 days).
 
-To force re-processing of a specific campaign, remove its GUID from `processed_guids` and re-run.
+To force re-processing of a specific campaign without triggering the reprocess workflow, remove its GUID from `processed_guids` and re-run.
 
 ---
 
@@ -150,12 +167,14 @@ Set these in **Settings → Secrets and variables → Actions**:
 
 | Variable | Default | Description |
 |---|---|---|
-| `PROOFPOINT_DISCOVERY_LOOKBACK_DAYS` | `40` | Days back to scan for new campaigns (daily workflow) |
+| `PROOFPOINT_DISCOVERY_LOOKBACK_DAYS` | `20` | Days back to scan for new campaigns (daily workflow) |
 | `END_DATE_OFFSET_DAYS` | `3` | Days after campaign end date before processing |
 | `START_DATE_OFFSET_DAYS` | `-2` | Days before campaign start for Proofpoint fetch window |
 | `AZURE_FUNCTION_BATCH_SIZE` | `5000` | Max rows per Azure Function job |
 | `BACKFILL_FROM` | — | Set by backfill workflow. Triggers month-by-month scan from this date. |
 | `BACKFILL_TO` | — | Set by backfill workflow. Caps scan end date. Defaults to today if blank. |
+| `REPROCESS_FROM` | — | Set by reprocess workflow. Force-runs campaigns from this date. |
+| `REPROCESS_TO` | — | Set by reprocess workflow. Force-runs campaigns up to this date. |
 | `LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`) |
 
 ---

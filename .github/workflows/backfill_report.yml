@@ -67,7 +67,7 @@ jobs:
           PROOFPOINT_RATE_LIMIT_DELAY:        '1.0'
           PROOFPOINT_RETRY_DELAY:             '5.0'
           PROOFPOINT_MAX_RETRIES:             '3'
-          PROOFPOINT_DISCOVERY_LOOKBACK_DAYS: '40'
+          PROOFPOINT_DISCOVERY_LOOKBACK_DAYS: '20'
           PROOFPOINT_DISCOVERY_MAX_PAGES:     '5'
           START_DATE_OFFSET_DAYS:             '-2'
           END_DATE_OFFSET_DAYS:               '3'
