@@ -493,8 +493,27 @@ def enrich_via_azure_function(merged_df: pd.DataFrame,
 
     import uuid as _uuid
 
-    # Only send rows still missing OS
-    missing_mask    = merged_df['splunk_os'].astype(str).str.strip() == ''
+    # Only look up OS for users who failed (clicked / compromised / attachment)
+    # or reported. Sent/opened-only users don't need OS enrichment.
+    # Within that subset, further restrict to rows still missing OS (Stage 1
+    # may have already resolved some via Proofpoint columns).
+    def _is_true(col):
+        return merged_df.get(col, pd.Series('', index=merged_df.index)).astype(str).str.upper() == 'TRUE'
+
+    failed_or_reported_mask = (
+        _is_true('Primary Clicked') |
+        _is_true('Primary Compromised Login') |
+        _is_true('Primary Attachment Open') |
+        _is_true('Reported')
+    )
+    missing_os_mask = merged_df['splunk_os'].astype(str).str.strip() == ''
+    missing_mask    = failed_or_reported_mask & missing_os_mask
+
+    skipped = int((~failed_or_reported_mask).sum())
+    if skipped:
+        logger.info("Azure Function: skipping %d sent/opened-only rows (OS lookup not needed).",
+                    skipped)
+
     missing_df      = merged_df[missing_mask].reset_index(drop=True)
     missing_indices = merged_df.index[missing_mask].tolist()
 
@@ -1212,16 +1231,25 @@ def run_report_for_campaign(campaign: dict, workday_df: pd.DataFrame,
         merged_df[_col] = ''
     merged_df = _fill_os_from_proofpoint_columns(merged_df)
 
-    # Stage 2: send only rows still missing OS to the Azure Function.
-    # The Function App runs Splunk queries for those users only, which
-    # reduces query volume and runtime significantly.
+    # Stage 2: send only failed/reported rows still missing OS to the Azure Function.
+    # Sent/opened-only users are excluded — no value querying Splunk for their OS.
     if os.getenv('AZURE_FUNCTION_URL'):
-        still_missing = int((merged_df['splunk_os'] == '').sum())
+        def _is_true_col(col):
+            return merged_df.get(col, pd.Series('', index=merged_df.index)).astype(str).str.upper() == 'TRUE'
+        failed_or_reported = (
+            _is_true_col('Primary Clicked') |
+            _is_true_col('Primary Compromised Login') |
+            _is_true_col('Primary Attachment Open') |
+            _is_true_col('Reported')
+        )
+        still_missing = int(
+            (failed_or_reported & (merged_df['splunk_os'] == '')).sum()
+        )
         logger.info("Stage 2 (Azure Function): %d rows still need OS lookup.", still_missing)
         if still_missing > 0:
             merged_df = enrich_via_azure_function(merged_df, splunk_earliest, splunk_latest)
         else:
-            logger.info("All rows resolved by Proofpoint columns — skipping Azure Function.")
+            logger.info("All failed/reported rows resolved — skipping Azure Function.")
     else:
         logger.warning("AZURE_FUNCTION_URL not set — Splunk enrichment skipped. "
                        "Only Proofpoint column OS data is available.")
@@ -1283,14 +1311,51 @@ def main():
     state.setdefault('processed_guids',   [])
     state.setdefault('pending_campaigns', [])
 
-    state = sync_pending_campaigns(state)
-    ready_campaigns = get_reportable_campaigns(state)
+    # ── Reprocess mode ───────────────────────────────────────────────────────
+    # If REPROCESS_FROM and REPROCESS_TO are set, ignore processed_guids and
+    # force-run all campaigns whose startDate >= REPROCESS_FROM and
+    # endDate <= REPROCESS_TO. State is NOT updated after reprocess so the
+    # processed_guids list remains unchanged.
+    reprocess_from = os.getenv('REPROCESS_FROM', '').strip()
+    reprocess_to   = os.getenv('REPROCESS_TO',   '').strip()
+    reprocess_mode = bool(reprocess_from and reprocess_to)
 
-    if not ready_campaigns:
-        logger.info("No campaigns ready. %d pending (waiting for end-date + %d day buffer).",
-                    len(state['pending_campaigns']), END_DATE_OFFSET_DAYS)
-        save_state(state)
-        sys.exit(0)
+    if reprocess_mode:
+        try:
+            rp_from = _parse_date(reprocess_from)
+            rp_to   = _parse_date(reprocess_to)
+        except ValueError as e:
+            logger.error("Invalid REPROCESS_FROM/TO date: %s — aborting.", e)
+            sys.exit(1)
+
+        logger.info("Reprocess mode: campaigns with startDate >= %s and endDate <= %s "
+                    "(ignoring processed_guids).", rp_from, rp_to)
+
+        all_campaigns = discover_campaigns_from_phishing_extended()
+        ready_campaigns = [
+            c for c in all_campaigns
+            if _parse_date(c['startDate']) >= rp_from
+            and _parse_date(c.get('endDate') or c['startDate']) <= rp_to
+        ]
+
+        if not ready_campaigns:
+            logger.info("No campaigns found in reprocess range %s → %s.", rp_from, rp_to)
+            sys.exit(0)
+
+        logger.info("%d campaign(s) found in reprocess range:", len(ready_campaigns))
+        for c in ready_campaigns:
+            logger.info("  guid=%-12s  start=%s  end=%s  title='%s'",
+                        c['guid'], c['startDate'], c.get('endDate', ''), c['title'])
+
+    else:
+        state = sync_pending_campaigns(state)
+        ready_campaigns = get_reportable_campaigns(state)
+
+        if not ready_campaigns:
+            logger.info("No campaigns ready. %d pending (waiting for end-date + %d day buffer).",
+                        len(state['pending_campaigns']), END_DATE_OFFSET_DAYS)
+            save_state(state)
+            sys.exit(0)
 
     logger.info("%d campaign(s) ready to process.", len(ready_campaigns))
 
@@ -1338,18 +1403,21 @@ def main():
                                          proofpoint_df_provider=_get_proofpoint_df)
             if ok:
                 succeeded.append(campaign['guid'])
-                # Save state immediately after each success so progress is
-                # preserved if the workflow is killed by the 6-hour timeout.
-                state['pending_campaigns'] = [
-                    c for c in state['pending_campaigns']
-                    if c['guid'] not in set(succeeded)
-                ]
-                state['processed_guids'] = list(
-                    set(state['processed_guids']) | set(succeeded)
-                )
-                save_state(state)
-                logger.info("State saved after guid=%s (%d processed so far).",
-                            campaign['guid'], len(state['processed_guids']))
+                if not reprocess_mode:
+                    # Save state immediately after each success so progress is
+                    # preserved if the workflow is killed by the 6-hour timeout.
+                    # In reprocess mode we intentionally do NOT update state so
+                    # processed_guids remains unchanged.
+                    state['pending_campaigns'] = [
+                        c for c in state['pending_campaigns']
+                        if c['guid'] not in set(succeeded)
+                    ]
+                    state['processed_guids'] = list(
+                        set(state['processed_guids']) | set(succeeded)
+                    )
+                    save_state(state)
+                    logger.info("State saved after guid=%s (%d processed so far).",
+                                campaign['guid'], len(state['processed_guids']))
             else:
                 failed.append(campaign['guid'])
         except Exception as e:
@@ -1357,11 +1425,13 @@ def main():
             failed.append(campaign['guid'])
 
     logger.info("=" * 70)
-    logger.info("DAILY RUN COMPLETE")
+    logger.info("REPROCESS COMPLETE" if reprocess_mode else "DAILY RUN COMPLETE")
     logger.info("Succeeded : %d  %s", len(succeeded), succeeded)
-    logger.info("Failed    : %d  %s  (will retry tomorrow)", len(failed), failed)
-    logger.info("Pending   : %d  (waiting for end-date buffer)", len(state['pending_campaigns']))
-    logger.info("Processed : %d  (all time)", len(state['processed_guids']))
+    logger.info("Failed    : %d  %s%s", len(failed), failed,
+                "" if reprocess_mode else "  (will retry tomorrow)")
+    if not reprocess_mode:
+        logger.info("Pending   : %d  (waiting for end-date buffer)", len(state['pending_campaigns']))
+        logger.info("Processed : %d  (all time)", len(state['processed_guids']))
     logger.info("=" * 70)
 
     if failed:
